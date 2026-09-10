@@ -26,48 +26,37 @@ Kitchen environments experience rapid changes in temperature, humidity, and air 
 ## 🖼️ System Architecture
 
 ```mermaid
-
-%%{init: {"flowchart": {"defaultRenderer": "elk"}} }%%
+%%{init: {"flowchart": {"curve": "step"}} }%%
 flowchart TB
 
-    subgraph HW["Hardware Layer"]
-        direction LR
+    AHT["AHT20<br/>Temperature & Humidity"]
+    MQ["MQ-135<br/>Air Quality"]
 
-        AHT["AHT20<br/>Temperature & Humidity"]
-        ESP["ESP32"]
-        MQ["MQ-135<br/>Air Quality"]
+    ESP["ESP32<br/>Local Monitoring & Control"]
 
-        AHT --> ESP
-        MQ --> ESP
-
-        ESP --> OLED["OLED Display"]
-        ESP --> FAN["MOSFET Driver<br/>+ Ventilation Fan"]
-    end
-
-    subgraph LOCAL["Local Control Layer"]
-        CONTROL["Multi-Variable Control Logic<br/>+ Anti-Chattering Protection"]
-    end
+    OLED["OLED Display"]
+    FAN["MOSFET Driver<br/>+ Ventilation Fan"]
 
     BROKER["MQTT Broker<br/>LWT + Telemetry + Commands"]
 
-    subgraph CLOUD["Backend & Data Layer"]
-        direction LR
-
-        DB["Database"]
-        BACKEND["Backend"]
-        AI["AI Prediction"]
-
-        BACKEND --> DB
-        BACKEND --> AI
-    end
+    BACKEND["Backend"]
+    DB["Database"]
+    AI["AI Prediction"]
 
     WEB["Web Dashboard<br/>Monitoring + Auto/Manual Control"]
 
-    ESP --> CONTROL
-    CONTROL --> FAN
+    AHT --> ESP
+    MQ --> ESP
+
+    ESP --> OLED
+    ESP --> FAN
 
     ESP <--> BROKER
+
     BROKER <--> BACKEND
+
+    BACKEND --> DB
+    BACKEND --> AI
 
     BACKEND <--> WEB
 ```
