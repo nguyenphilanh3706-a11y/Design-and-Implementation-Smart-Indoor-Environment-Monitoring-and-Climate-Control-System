@@ -1,0 +1,143 @@
+# =====================================================================
+#  HẠ TẦNG BACKEND - ĐỒ ÁN IOT GIÁM SÁT & THÔNG GIÓ PHÒNG BẾP
+#  Thành viên 3 - Tuần 1
+#
+#  Chạy:      docker compose up -d --build
+#  Xem log:   docker compose logs -f backend
+#  Dừng:      docker compose down            (giữ dữ liệu)
+#             docker compose down -v         (xoá luôn dữ liệu + chạy lại file SQL khởi tạo)
+#
+#  Mọi mật khẩu lấy từ file .env (sao chép từ .env.example). KHÔNG commit .env lên Git.
+# =====================================================================
+
+services:
+  # -------------------------------------------------------------------
+  # 1. MQTT BROKER
+  # -------------------------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: kitchen-mosquitto
+    restart: unless-stopped
+    ports:
+      - "${MQTT_PORT_HOST:-1883}:1883"     # MQTT cho ESP32 / Backend
+      - "${WS_PORT_HOST:-9001}:9001"       # MQTT over WebSockets cho Dashboard
+    volumes:
+      - ./mosquitto/config:/mosquitto/config:ro
+      - mosquitto_data:/mosquitto/data     # giữ bản tin retain sau khi khởi động lại
+    environment:
+      DEVICE_ID: ${DEVICE_ID:-esp32_kitchen_01}
+      MQTT_BACKEND_PASSWORD: ${MQTT_BACKEND_PASSWORD:?Thiếu MQTT_BACKEND_PASSWORD - hãy tạo file .env}
+      MQTT_DEVICE_PASSWORD: ${MQTT_DEVICE_PASSWORD:?Thiếu MQTT_DEVICE_PASSWORD trong .env}
+      MQTT_WEB_PASSWORD: ${MQTT_WEB_PASSWORD:?Thiếu MQTT_WEB_PASSWORD trong .env}
+    # Tự sinh file mật khẩu + ACL trong container rồi mới chạy Broker.
+    # Nhờ vậy mật khẩu chỉ nằm ở .env và file luôn có quyền 0600 đúng chủ sở hữu.
+    entrypoint: ["/bin/ash", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /mosquitto/runtime
+        # QUAN TRỌNG: mosquitto_passwd -c KHÔNG ghi đè file đã tồn tại mà báo lỗi.
+        # Nếu không xoá trước, lệnh "docker compose restart mosquitto" sẽ làm container chết
+        # (container cũ được dùng lại nên file của lần chạy trước vẫn còn).
+        rm -f /mosquitto/runtime/passwd /mosquitto/runtime/acl
+        mosquitto_passwd -c -b /mosquitto/runtime/passwd backend_svc   "$$MQTT_BACKEND_PASSWORD"
+        mosquitto_passwd -b    /mosquitto/runtime/passwd esp32_device  "$$MQTT_DEVICE_PASSWORD"
+        mosquitto_passwd -b    /mosquitto/runtime/passwd web_dashboard "$$MQTT_WEB_PASSWORD"
+        sed "s/__DEVICE_ID__/$$DEVICE_ID/g" /mosquitto/config/acl.template > /mosquitto/runtime/acl
+        chown -R mosquitto:mosquitto /mosquitto/runtime /mosquitto/data
+        chmod 700 /mosquitto/runtime
+        chmod 600 /mosquitto/runtime/passwd /mosquitto/runtime/acl
+        echo "[init] Da tao 3 tai khoan MQTT va ACL cho thiet bi $$DEVICE_ID"
+        exec /usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf
+    healthcheck:
+      # Kết nối thật vào Broker và đọc 1 bản tin $SYS -> chứng minh cả mạng lẫn xác thực đều chạy
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -u backend_svc -P \"$$MQTT_BACKEND_PASSWORD\" -t '$$SYS/broker/uptime' -C 1 -W 3 >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks: [kitchen-net]
+
+  # -------------------------------------------------------------------
+  # 2. CSDL CHUỖI THỜI GIAN
+  # -------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    container_name: kitchen-timescaledb
+    restart: unless-stopped
+    ports:
+      - "${PG_PORT_HOST:-5432}:5432"       # mở ra ngoài để dùng DBeaver / pgAdmin trên Windows
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-iot_kitchen}
+      POSTGRES_USER: ${POSTGRES_USER:-iot_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Thiếu POSTGRES_PASSWORD trong .env}
+      TIMESCALEDB_TELEMETRY: "off"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      # Các file .sql ở đây CHỈ chạy khi thư mục dữ liệu còn trống (lần đầu tiên).
+      # Sửa schema xong phải: docker compose down -v && docker compose up -d
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [kitchen-net]
+
+  # -------------------------------------------------------------------
+  # 3. BACKEND: ingest MQTT -> TimescaleDB, REST API, cảnh báo Telegram
+  # -------------------------------------------------------------------
+  backend:
+    build: ./backend
+    container_name: kitchen-backend
+    restart: unless-stopped
+    ports:
+      - "${API_PORT_HOST:-8000}:8000"
+    env_file: .env
+    environment:
+      # Trong mạng nội bộ của Docker, tên service chính là tên miền -> không dùng localhost
+      POSTGRES_HOST: timescaledb
+      POSTGRES_PORT: 5432
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      MQTT_USER: backend_svc
+      MQTT_PASSWORD: ${MQTT_BACKEND_PASSWORD}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    networks: [kitchen-net]
+
+  # -------------------------------------------------------------------
+  # 4. ESP32 GIẢ LẬP (tuỳ chọn) - để kiểm thử khi chưa có phần cứng của TV1/TV2
+  #    Chạy:  docker compose --profile sim up -d simulator
+  #    Kịch bản khói: SIM_SCENARIO=smoke docker compose --profile sim up simulator
+  # -------------------------------------------------------------------
+  simulator:
+    build: ./backend
+    container_name: kitchen-simulator
+    profiles: ["sim"]
+    restart: "no"
+    volumes:
+      - ./tools:/app/tools:ro
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      MQTT_USER: esp32_device
+      MQTT_PASSWORD: ${MQTT_DEVICE_PASSWORD}
+      DEVICE_ID: ${DEVICE_ID:-esp32_kitchen_01}
+    command: ["python", "tools/simulate_esp32.py", "--scenario", "${SIM_SCENARIO:-normal}"]
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    networks: [kitchen-net]
+
+volumes:
+  timescale_data:
+  mosquitto_data:
+
+networks:
+  kitchen-net:
+    name: kitchen-net

@@ -1,0 +1,146 @@
+# =====================================================================
+#  BỘ REQUEST KIỂM THỬ REST API
+#  Cài extension "REST Client" (humao.rest-client) rồi bấm "Send Request"
+#  ngay phía trên mỗi request. Không cần Postman.
+# =====================================================================
+
+@baseUrl = http://localhost:8000
+@api = {{baseUrl}}/api/v1/kitchen
+
+### 1. Sức khoẻ dịch vụ - phải thấy database + mqtt là "connected"
+GET {{baseUrl}}/health
+
+### 2. Trạng thái hiện tại (dùng cho widget chính của Dashboard)
+GET {{api}}/status
+
+### 3. Lịch sử 1 giờ gần nhất, 20 điểm mới nhất
+GET {{api}}/history?limit=20&order=desc
+
+### 4. Lịch sử 24 giờ, gộp trung bình mỗi phút (biểu đồ nhẹ hơn 30 lần)
+GET {{api}}/history?limit=1440&bucket_seconds=60
+
+### 5. Lịch sử theo khoảng thời gian cụ thể (sửa lại ngày giờ cho khớp lúc bạn chạy)
+GET {{api}}/history?start=2026-09-12T00:00:00Z&end=2026-09-12T23:59:59Z&limit=500&bucket_seconds=300
+
+### 6. Chuyển sang MANUAL - bắt buộc làm trước khi bật/tắt quạt bằng tay
+POST {{api}}/mode
+Content-Type: application/json
+
+{
+  "mode": "MANUAL"
+}
+
+### 7. BẬT quạt - xem rtt_ms để lấy số liệu cho Bài test 2
+POST {{api}}/actuator
+Content-Type: application/json
+
+{
+  "state": 1
+}
+
+### 8. TẮT quạt
+POST {{api}}/actuator
+Content-Type: application/json
+
+{
+  "state": 0
+}
+
+### 9. Trả về AUTO cho FSM tự chạy
+POST {{api}}/mode
+Content-Type: application/json
+
+{
+  "mode": "AUTO"
+}
+
+### 10. Xem ngưỡng đang áp dụng
+GET {{api}}/config
+
+### 11. Đổi ngưỡng FSM (3 trường này được gửi xuống ESP32)
+POST {{api}}/config
+Content-Type: application/json
+
+{
+  "pollution_threshold": 50,
+  "temp_threshold": 33,
+  "dwell_time_seconds": 30
+}
+
+### 12. Hạ ngưỡng cảnh báo xuống 20% để thử Telegram mà không cần đốt khói
+POST {{api}}/config
+Content-Type: application/json
+
+{
+  "alert_pollution_threshold": 20
+}
+
+### 13. Trả ngưỡng cảnh báo về 50% như Bản thống nhất
+POST {{api}}/config
+Content-Type: application/json
+
+{
+  "alert_pollution_threshold": 50
+}
+
+### 14. Gửi thử tin nhắn Telegram
+POST {{api}}/alerts/test
+
+### 15. CHẤM ĐIỂM DATA CONTRACT - gửi kết quả này cho TV2 khi firmware chưa đúng quy ước
+GET {{api}}/diagnostics?minutes=10
+
+### 15b. Chẩn đoán 1 giờ gần nhất (lấy số liệu Bài test 1 và Bài test 4 cho báo cáo)
+GET {{api}}/diagnostics?minutes=60&expected_interval_s=2
+
+### 16. Nhật ký sự kiện gần đây
+GET {{api}}/events?limit=20
+
+### 16b. Các lần ngưỡng trên thiết bị lệch với CSDL
+GET {{api}}/events?limit=20&event_type=CONFIG_MISMATCH
+
+### 16c. Các lần cảm biến báo số đo không hợp lệ
+GET {{api}}/events?limit=20&event_type=SENSOR_FAULT
+
+### 17. Chỉ xem các lần đã gửi cảnh báo
+GET {{api}}/events?limit=20&event_type=ALERT_SENT
+
+### 18. Chỉ xem các lần thiết bị mất kết nối
+GET {{api}}/events?limit=20&event_type=DEVICE_OFFLINE
+
+### ==== CÁC TRƯỜNG HỢP LỖI (kiểm tra API có kiểm soát đầu vào không) ====
+
+### 19. state sai kiểu -> phải trả 422 kèm mô tả lỗi
+POST {{api}}/actuator
+Content-Type: application/json
+
+{
+  "state": 5
+}
+
+### 20. mode sai -> phải trả 422
+POST {{api}}/mode
+Content-Type: application/json
+
+{
+  "mode": "TỰ ĐỘNG"
+}
+
+### 21. body rỗng -> phải trả 422 "Cần gửi ít nhất 1 tham số cấu hình"
+POST {{api}}/config
+Content-Type: application/json
+
+{}
+
+### 22. Ngưỡng ngoài khoảng 0-100 -> phải trả 422
+POST {{api}}/config
+Content-Type: application/json
+
+{
+  "pollution_threshold": 150
+}
+
+### 23. Thiết bị không tồn tại -> vẫn trả 200 nhưng freshness_level = NO_DATA
+GET {{api}}/status?device_id=esp32_khong_co_that
+
+### 24. Đặc tả OpenAPI (import file này vào Postman nếu muốn dùng Postman)
+GET {{baseUrl}}/openapi.json
