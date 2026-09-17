@@ -1,0 +1,49 @@
+# =====================================================================
+#  CADDY - cổng vào duy nhất khi chạy trên máy chủ đám mây
+#
+#  Caddy tự xin chứng chỉ Let's Encrypt và tự gia hạn, nên bạn có https
+#  mà không phải làm gì thêm. Nó cũng gộp REST API và WebSocket về CÙNG
+#  MỘT tên miền, nhờ đó:
+#    * Dashboard không dính CORS (cùng origin nếu phục vụ luôn tại đây)
+#    * Không dính lỗi chặn nội dung hỗn hợp: trang https gọi wss cùng miền
+#    * TV4 chỉ phải nhớ một địa chỉ thay vì hai tunnel
+#
+#  Thay iot.ten-mien-cua-ban.com bằng tên miền thật đã trỏ A record về IP máy chủ.
+# =====================================================================
+
+iot.ten-mien-cua-ban.com {
+	encode gzip
+
+	# ---- MQTT over WebSockets cho Dashboard ----
+	# Trình duyệt nối tới wss://iot.ten-mien-cua-ban.com/mqtt
+	handle /mqtt* {
+		reverse_proxy mosquitto:9001
+	}
+
+	# ---- REST API + Swagger ----
+	handle /api/* {
+		reverse_proxy backend:8000
+	}
+	handle /docs* {
+		reverse_proxy backend:8000
+	}
+	handle /openapi.json {
+		reverse_proxy backend:8000
+	}
+	handle /health {
+		reverse_proxy backend:8000
+	}
+
+	# ---- Mọi đường dẫn còn lại: Dashboard đã build của TV4 ----
+	# Chép thư mục dist của TV4 vào ./web trên máy chủ.
+	handle {
+		root * /srv/web
+		try_files {path} /index.html      # để React Router không bị 404 khi tải lại trang
+		file_server
+	}
+
+	log {
+		output file /var/log/caddy/access.log
+		format json
+	}
+}

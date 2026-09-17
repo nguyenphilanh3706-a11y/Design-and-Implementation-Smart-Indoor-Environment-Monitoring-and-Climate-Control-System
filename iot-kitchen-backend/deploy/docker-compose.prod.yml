@@ -1,0 +1,53 @@
+# =====================================================================
+#  LỚP CẤU HÌNH CHO MÁY CHỦ ĐÁM MÂY - dùng chồng lên docker-compose.yml
+#
+#  Chạy trên máy chủ:
+#      docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d --build
+#
+#  File này chỉ làm 2 việc: thêm Caddy làm cổng vào có https, và đặt
+#  restart: always để container tự lên lại sau khi máy chủ khởi động lại.
+#
+#  Việc KHÔNG mở cổng ra Internet được xử lý bằng .env chứ không phải ở đây,
+#  vì docker-compose.yml đã viết ports dạng "${API_PORT_HOST:-8000}:8000".
+#  Trong .env trên máy chủ đặt:
+#      API_PORT_HOST=127.0.0.1:8000     -> chỉ Caddy trong máy gọi được
+#      PG_PORT_HOST=127.0.0.1:5432      -> CSDL không lộ ra Internet
+#      WS_PORT_HOST=127.0.0.1:9001      -> Dashboard đi qua Caddy, không vào thẳng
+#      AI_PORT_HOST=127.0.0.1:9100
+#      MQTT_PORT_HOST=1883              -> GIỮ NGUYÊN, ESP32 cần nối thẳng vào
+# =====================================================================
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: kitchen-caddy
+    restart: always
+    ports:
+      - "80:80"        # Let's Encrypt dùng cổng 80 để xác minh tên miền
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./web:/srv/web:ro      # thư mục dist của TV4; chưa có cũng không sao
+      - caddy_data:/data       # nơi lưu chứng chỉ, mất là phải xin lại
+      - caddy_config:/config
+    depends_on:
+      - backend
+      - mosquitto
+    networks: [kitchen-net]
+
+  backend:
+    restart: always
+
+  timescaledb:
+    restart: always
+
+  mosquitto:
+    restart: always
+
+  ai:
+    restart: always
+
+volumes:
+  caddy_data:
+  caddy_config:

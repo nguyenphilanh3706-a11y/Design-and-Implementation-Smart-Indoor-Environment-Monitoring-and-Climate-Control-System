@@ -1,0 +1,9 @@
+# Ghim đúng phiên bản đã kiểm thử. Nếu TV5 gửi file .pkl train trên máy khác,
+# phải hỏi phiên bản scikit-learn bên đó (pip show scikit-learn) và sửa dòng dưới cho khớp,
+# vì file .pkl của joblib phụ thuộc phiên bản thư viện lúc train.
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+scikit-learn==1.9.1
+pandas==3.0.5
+numpy==2.5.3
+joblib==1.6.0

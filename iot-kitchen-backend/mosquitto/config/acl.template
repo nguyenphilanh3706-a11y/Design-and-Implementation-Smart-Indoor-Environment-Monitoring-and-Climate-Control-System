@@ -1,0 +1,51 @@
+# =====================================================================
+#  DANH SÁCH KIỂM SOÁT TRUY CẬP (ACL) - nguyên tắc đặc quyền tối thiểu
+#  __DEVICE_ID__ được thay bằng biến DEVICE_ID trong .env lúc container khởi động,
+#  nên đổi tên thiết bị ở .env là ACL tự khớp theo (không phải sửa 2 chỗ).
+#
+#  Cú pháp:  topic [read|write|readwrite] <bộ lọc topic>
+#  "write" = client được PUBLISH, "read" = client được SUBSCRIBE/nhận.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# backend_svc - Backend FastAPI: đọc mọi dữ liệu, gửi mọi lệnh trong dự án
+# ---------------------------------------------------------------------
+user backend_svc
+topic readwrite iot/kitchen/#
+topic read $SYS/#
+
+# ---------------------------------------------------------------------
+# esp32_device - ESP32 (TV2)
+#   Chỉ được GHI dữ liệu của chính nó và chỉ được ĐỌC lệnh.
+#   Nhờ vậy, nếu thiết bị bị chiếm quyền, nó cũng không giả mạo lệnh
+#   điều khiển quạt hay ghi đè dữ liệu của thiết bị khác.
+# ---------------------------------------------------------------------
+user esp32_device
+topic write iot/kitchen/__DEVICE_ID__/telemetry
+topic write iot/kitchen/__DEVICE_ID__/status
+topic write iot/kitchen/__DEVICE_ID__/actuator/state
+topic write iot/kitchen/__DEVICE_ID__/config/state
+topic read iot/kitchen/__DEVICE_ID__/actuator/set
+topic read iot/kitchen/__DEVICE_ID__/mode/set
+topic read iot/kitchen/__DEVICE_ID__/config/set
+
+# ---------------------------------------------------------------------
+# web_dashboard - Web Dashboard (TV4) chạy trong trình duyệt
+#   CHỈ ĐƯỢC ĐỌC. Mọi thao tác điều khiển phải đi qua REST API của Backend
+#   để còn ghi nhật ký (bảng system_events) và kiểm tra dữ liệu đầu vào.
+#   Mật khẩu của user này lộ ra trong mã JavaScript nên không thể cho quyền ghi.
+# ---------------------------------------------------------------------
+user web_dashboard
+topic read iot/kitchen/#
+
+# ---------------------------------------------------------------------
+# Khi mở rộng nhiều bếp: đặt client_id của ESP32 đúng bằng device_id rồi thay
+# 6 dòng của esp32_device bằng mẫu dưới đây (%c = client_id do Broker tự thay):
+#   pattern write iot/kitchen/%c/telemetry
+#   pattern write iot/kitchen/%c/status
+#   pattern write iot/kitchen/%c/actuator/state
+#   pattern write iot/kitchen/%c/config/state
+#   pattern read  iot/kitchen/%c/actuator/set
+#   pattern read  iot/kitchen/%c/mode/set
+#   pattern read  iot/kitchen/%c/config/set
+# ---------------------------------------------------------------------
