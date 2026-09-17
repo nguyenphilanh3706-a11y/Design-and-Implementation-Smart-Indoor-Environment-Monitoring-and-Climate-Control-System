@@ -8,7 +8,7 @@ The project supports real-time monitoring, historical data visualization, multi-
 
 ## 💡 Motivation
 
-House environments experience rapid changes in temperature, humidity, and air quality during cooking, directly impacting indoor comfort and safety. This project serves as a practical smart home prototype, integrating embedded systems, IoT networking, backend architecture, web development, and intelligent control algorithms to address a real-world problem.
+Kitchen environments experience rapid changes in temperature, humidity, and air quality during cooking, directly impacting indoor comfort and safety. This project serves as a practical smart home prototype, integrating embedded systems, IoT networking, backend architecture, web development, and intelligent control algorithms to address a real-world problem.
 
 ## ✨ Key Features
 
