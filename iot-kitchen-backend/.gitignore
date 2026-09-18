@@ -1,0 +1,25 @@
+# Bí mật - tuyệt đối không commit
+.env
+mosquitto/runtime/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Mô hình AI: file nhị phân ~6 MB, sinh lại được bằng train_ai.py
+ai/models/*.pkl
+ai/data/*.csv
+
+# Công cụ / hệ điều hành
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Kết quả đo đạc xuất ra khi làm 4 bài test
+*.csv
+!docs/**/*.csv
+*.log

@@ -1,0 +1,3 @@
+# Script chạy trên Linux phải giữ dấu xuống dòng kiểu LF, kể cả khi checkout trên Windows.
+# Thiếu dòng này thì container báo "bad interpreter: no such file or directory".
+*.sh text eol=lf
