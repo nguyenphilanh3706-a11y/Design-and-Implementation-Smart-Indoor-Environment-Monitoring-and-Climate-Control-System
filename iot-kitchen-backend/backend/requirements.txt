@@ -1,0 +1,7 @@
+# Ghim đúng phiên bản đã kiểm thử (11/09/2026) để mọi máy trong nhóm chạy giống nhau.
+fastapi==0.141.1          # REST API + tự sinh tài liệu OpenAPI/Swagger
+uvicorn[standard]==0.52.4 # ASGI server chạy FastAPI
+pydantic==2.13.5          # Kiểm tra payload đúng data contract
+asyncpg==0.31.0           # Driver PostgreSQL bất đồng bộ (nhanh hơn psycopg2 cho tác vụ ghi liên tục)
+aiomqtt==2.5.1            # MQTT client asyncio (bọc quanh paho-mqtt 2.x)
+httpx==0.28.1             # Gọi HTTP API của Telegram

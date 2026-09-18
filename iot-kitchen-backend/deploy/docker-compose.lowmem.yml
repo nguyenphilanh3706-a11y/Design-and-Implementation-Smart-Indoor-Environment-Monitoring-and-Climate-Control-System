@@ -1,0 +1,51 @@
+# =====================================================================
+#  LỚP CẤU HÌNH CHO MÁY 1 GB RAM (Google Cloud e2-micro, AWS t2.micro)
+#
+#  Chạy chồng lên 2 file kia:
+#      docker compose -f docker-compose.yml \
+#                     -f deploy/docker-compose.prod.yml \
+#                     -f deploy/docker-compose.lowmem.yml up -d
+#
+#  Bộ nhớ ĐO THỰC TẾ của từng phần:
+#      dịch vụ AI (scikit-learn + pandas + model)  181 MB
+#      backend FastAPI                              51 MB
+#      PostgreSQL mặc định                         100 MB  -> chỉnh xuống còn ~60 MB
+#      Mosquitto                                   ~10 MB
+#      Caddy                                       ~20 MB
+#      Tổng                                       ~330 MB, vừa với máy 1 GB
+#
+#  Giới hạn mem_limit bên dưới để nếu có rò rỉ bộ nhớ thì Docker giết đúng
+#  container đó rồi khởi động lại, thay vì treo cả máy chủ.
+# =====================================================================
+
+services:
+  timescaledb:
+    # Mặc định PostgreSQL dành 128 MB cho shared_buffers và cho phép 100 kết nối,
+    # quá thừa với một hệ thống ghi 1 bản ghi mỗi 2 giây.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - max_connections=20
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - timescaledb.max_background_workers=2
+    mem_limit: 320m
+
+  backend:
+    mem_limit: 200m
+
+  ai:
+    mem_limit: 400m
+
+  mosquitto:
+    mem_limit: 64m
+
+  caddy:
+    mem_limit: 64m
