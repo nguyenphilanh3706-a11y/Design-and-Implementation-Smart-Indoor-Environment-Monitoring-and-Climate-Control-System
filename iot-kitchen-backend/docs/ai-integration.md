@@ -77,7 +77,17 @@ Dịch vụ AI bỏ trường `timestamp` mà `predict_future()` trả về, Bac
 chuẩn UTC kèm mili-giây khi publish. Phần dự báo và xu hướng thì lấy nguyên từ hàm của TV5.
 TV5 nên sửa lại dòng này nếu còn dùng đoạn code đó ở chỗ khác.
 
-### 2.4 `ai_service.py` gọi `exit()` khi thiếu file mô hình
+### 2.4 `ai_service.py` import `paho.mqtt` dù không dùng tới
+
+Dòng `import paho.mqtt.client as mqtt` ở đầu file là tàn dư từ lúc `ai_service.py` chạy như một
+script độc lập. Hàm `predict_future()` không dùng tới nó, nhưng Python vẫn phải import được thì
+module mới nạp xong.
+
+Container AI vì vậy phải cài `paho-mqtt` dù phần MQTT thật do Backend lo. Thiếu nó thì `/reload`
+trả 503 với thông báo `No module named 'paho'`. TV5 có thể xoá dòng import đó cho sạch, nhưng giữ
+nguyên cũng không sao vì `ai/requirements.txt` đã khai.
+
+### 2.5 `ai_service.py` gọi `exit()` khi thiếu file mô hình
 
 Dòng `exit()` ở đầu file rất hợp lý khi chạy như một script độc lập, nhưng khi import vào dịch vụ
 thì nó tắt luôn cả tiến trình, khiến `/health` mất khả năng báo lý do. Dịch vụ AI bắt `SystemExit`
@@ -133,6 +143,7 @@ Chạy thật với mô hình do `train_ai.py` sinh ra:
 |---|---|
 | Nạp mô hình | Qua `tv5/ai_service.py`, tự nhận ra cửa sổ 20 mẫu x 4 đặc trưng |
 | Thiếu file `.pkl` | Dịch vụ vẫn sống, `/health` trả `no_model` kèm đường dẫn thiếu, `/predict` trả 503 |
+| Thiếu `paho-mqtt` | Tái hiện được lỗi `No module named 'paho'`; đã bổ sung vào `ai/requirements.txt` |
 | Nạp nóng | Chép file `.pkl` vào rồi gọi `/reload`, dùng được ngay, không khởi động lại container |
 | Thời gian suy luận | 4,9 đến 9,7 ms |
 | Publish MQTT | Đúng chu kỳ, payload đúng hợp đồng |

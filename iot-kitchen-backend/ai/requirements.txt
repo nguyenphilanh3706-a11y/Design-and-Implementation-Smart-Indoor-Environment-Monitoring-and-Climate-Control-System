@@ -7,3 +7,7 @@ scikit-learn==1.9.1
 pandas==3.0.5
 numpy==2.5.3
 joblib==1.6.0
+# tv5/ai_service.py có dòng "import paho.mqtt.client as mqtt" ở đầu file, dù hàm
+# predict_future() không dùng tới. Thiếu gói này thì import module thất bại và
+# dịch vụ báo "No module named 'paho'". Phần MQTT thật do backend lo, không phải ở đây.
+paho-mqtt==2.1.0
