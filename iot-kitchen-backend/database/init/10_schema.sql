@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS telemetry (
     received_at        TIMESTAMPTZ      NOT NULL DEFAULT now(), -- thời điểm Backend nhận được -> dùng đo độ trễ (Bài test 1)
     device_id          TEXT             NOT NULL,
     seq                BIGINT,                                   -- số thứ tự bản tin do ESP32 đếm tăng dần (Bài test 4: đo mất gói chính xác)
+    gas_ppm            DOUBLE PRECISION CHECK (gas_ppm >= 0),    -- nồng độ khí MQ-135 quy đổi ra ppm, do ESP32 tính theo hiệu chuẩn của TV1
+    fan_speed_percent  SMALLINT CHECK (fan_speed_percent BETWEEN 0 AND 100),  -- tốc độ quạt thiết bị báo về: 0 / 50 / 100
     temperature        DOUBLE PRECISION,                         -- °C
     humidity           DOUBLE PRECISION,                         -- %RH
     pollution_percent  DOUBLE PRECISION CHECK (pollution_percent BETWEEN 0 AND 100),
@@ -71,6 +73,12 @@ CREATE TABLE IF NOT EXISTS device_config (
     -- Ngưỡng cảnh báo Telegram: chỉ Backend sử dụng
     alert_pollution_threshold  DOUBLE PRECISION NOT NULL DEFAULT 50 CHECK (alert_pollution_threshold BETWEEN 0 AND 100),
     alert_temp_threshold       DOUBLE PRECISION NOT NULL DEFAULT 40 CHECK (alert_temp_threshold BETWEEN 0 AND 100),
+    -- Thang chất lượng không khí theo ppm: < mid là GOOD, mid..bad là MID, > bad là BAD
+    -- Gửi xuống ESP32 để FSM chọn tốc độ quạt 0% / 50% / 100%
+    ppm_mid_threshold          DOUBLE PRECISION NOT NULL DEFAULT 800  CHECK (ppm_mid_threshold > 0),
+    ppm_bad_threshold          DOUBLE PRECISION NOT NULL DEFAULT 1000 CHECK (ppm_bad_threshold > 0),
+    -- Ngưỡng gửi SMS cảnh báo: chỉ Backend sử dụng
+    alert_ppm_threshold        DOUBLE PRECISION NOT NULL DEFAULT 1000 CHECK (alert_ppm_threshold > 0),
     updated_at                 TIMESTAMPTZ      NOT NULL DEFAULT now(),
     updated_by                 TEXT             NOT NULL DEFAULT 'system'
 );

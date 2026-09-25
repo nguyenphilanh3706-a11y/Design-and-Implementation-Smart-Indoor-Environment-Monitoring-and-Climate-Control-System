@@ -14,8 +14,8 @@ from .schemas import TelemetryIn
 log = logging.getLogger("db")
 
 CONFIG_COLUMNS = (
-    "pollution_threshold", "temp_threshold", "dwell_time_seconds",
-    "alert_pollution_threshold", "alert_temp_threshold",
+    "temp_threshold", "dwell_time_seconds", "alert_temp_threshold",
+    "ppm_mid_threshold", "ppm_bad_threshold", "alert_ppm_threshold",
 )
 
 
@@ -65,18 +65,20 @@ class Database:
         await self.pool.execute(
             """
             INSERT INTO telemetry (time, received_at, device_id, seq, temperature, humidity,
-                                   pollution_percent, rs_ro_ratio, fan_state, mode, network_status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                   pollution_percent, rs_ro_ratio, fan_state, mode, network_status,
+                                   gas_ppm, fan_speed_percent)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             """,
             sample_time, received_at, device_id, t.seq, t.temperature, t.humidity,
             t.pollution_percent, t.rs_ro_ratio, t.fan_state, t.mode, t.network_status,
+            t.gas_ppm, t.fan_speed_percent,
         )
 
     async def latest_telemetry(self, device_id: str) -> asyncpg.Record | None:
         return await self.pool.fetchrow(
             """
             SELECT time AS timestamp, received_at, seq, temperature, humidity, pollution_percent,
-                   rs_ro_ratio, fan_state, mode, network_status
+                   rs_ro_ratio, fan_state, mode, network_status, gas_ppm, fan_speed_percent
             FROM telemetry
             WHERE device_id = $1
             ORDER BY time DESC
@@ -95,7 +97,7 @@ class Database:
             rows = await self.pool.fetch(
                 f"""
                 SELECT time AS timestamp, received_at, seq, temperature, humidity, pollution_percent,
-                       rs_ro_ratio, fan_state, mode, network_status
+                       rs_ro_ratio, fan_state, mode, network_status, gas_ppm, fan_speed_percent
                 FROM telemetry {where}
                 ORDER BY time {direction}
                 LIMIT $4 OFFSET $5
@@ -118,7 +120,9 @@ class Database:
                    round(avg(humidity)::numeric, 2)::float8           AS humidity,
                    round(avg(pollution_percent)::numeric, 2)::float8  AS pollution_percent,
                    round(avg(rs_ro_ratio)::numeric, 3)::float8        AS rs_ro_ratio,
+                   round(avg(gas_ppm)::numeric, 0)::float8            AS gas_ppm,
                    last(fan_state, time)                              AS fan_state,
+                   last(fan_speed_percent, time)                      AS fan_speed_percent,
                    last(mode, time)                                   AS mode
             FROM telemetry {where}
             GROUP BY 1
@@ -148,8 +152,12 @@ class Database:
                 count(seq)                                                      AS with_seq,
                 min(seq)                                                        AS seq_min,
                 max(seq)                                                        AS seq_max,
-                -- mất gói theo số thứ tự: cộng dồn phần bị nhảy cóc
-                coalesce(sum(seq - prev_seq - 1)
+                -- mất gói theo số thứ tự: cộng dồn phần bị nhảy cóc, NHƯNG không vượt quá số gói
+                -- mà khoảng thời gian giữa 2 bản tin chứa được. Một bản tin gửi tay hay firmware lỗi
+                -- mang seq bất thường (VD nhảy 60 -> 777777 trong 1 giây) sẽ không bị tính thành
+                -- 777 nghìn gói mất, vì trong 1 giây vật lý không thể mất quá 0 gói.
+                coalesce(sum(LEAST(seq - prev_seq - 1,
+                                   GREATEST(0, round(extract(epoch FROM time - prev_time) / $3)::bigint - 1)))
                          FILTER (WHERE seq > prev_seq + 1), 0)                  AS seq_missing,
                 count(*) FILTER (WHERE seq < prev_seq)                          AS reboots,
                 -- ước lượng theo khoảng trống thời gian (dùng khi firmware chưa gửi seq)

@@ -62,25 +62,26 @@ POST {{api}}/config
 Content-Type: application/json
 
 {
-  "pollution_threshold": 40,
+  "ppm_mid_threshold": 800,
+  "ppm_bad_threshold": 1000,
   "temp_threshold": 33,
   "dwell_time_seconds": 30
 }
 
-### 12. Hạ ngưỡng cảnh báo xuống 20% để thử Telegram mà không cần đốt khói
+### 12. Hạ ngưỡng cảnh báo xuống 100 ppm để thử Telegram mà không cần đốt khói
 POST {{api}}/config
 Content-Type: application/json
 
 {
-  "alert_pollution_threshold": 20
+  "alert_ppm_threshold": 100
 }
 
-### 13. Trả ngưỡng cảnh báo về 50% như Bản thống nhất
+### 13. Trả ngưỡng cảnh báo về 1000 ppm
 POST {{api}}/config
 Content-Type: application/json
 
 {
-  "alert_pollution_threshold": 50
+  "alert_ppm_threshold": 1000
 }
 
 ### 14. Gửi thử tin nhắn Telegram
@@ -131,12 +132,12 @@ Content-Type: application/json
 
 {}
 
-### 22. Ngưỡng ngoài khoảng 0-100 -> phải trả 422
+### 22. Ngưỡng ngoài khoảng 0-10000 ppm -> phải trả 422
 POST {{api}}/config
 Content-Type: application/json
 
 {
-  "pollution_threshold": 150
+  "ppm_bad_threshold": 20000
 }
 
 ### 23. Thiết bị không tồn tại -> vẫn trả 200 nhưng freshness_level = NO_DATA

@@ -43,9 +43,11 @@ class FakeKitchen:
         self.temperature = 29.5
         self.humidity = 66.0
         self.fan = 0
+        self.speed = 0                  # tốc độ quạt 0 / 50 / 100 (%)
+        self.ppm_mid = 800.0            # < 800 GOOD, 800-1000 MID, > 1000 BAD
+        self.ppm_bad = 1000.0
         self.mode = "AUTO"
         self.reason = "FSM"
-        self.pollution_threshold = 40.0
         self.temp_threshold = 33.0
         self.dwell = 30.0
         self.last_change = -999.0
@@ -57,8 +59,8 @@ class FakeKitchen:
     def step(self, dt: float) -> None:
         self.t += dt
         target = self._target_pollution()
-        if self.fan:
-            target = max(8.0, target - 18.0)          # quạt hút bớt khói -> nồng độ giảm nhanh hơn
+        if self.speed:
+            target = max(8.0, target - 18.0 * self.speed / 100)   # quạt càng mạnh càng hút được nhiều khói
         # Tiến dần về giá trị mục tiêu (lọc thông thấp) + nhiễu ngẫu nhiên của cảm biến
         self.pollution += (target - self.pollution) * min(1.0, dt / 8.0) + random.uniform(-0.6, 0.6)
         self.pollution = max(5.0, min(100.0, self.pollution))
@@ -79,31 +81,40 @@ class FakeKitchen:
         return 15.0                                   # tắt bếp, mở cửa sổ -> về mức an toàn
 
     @property
+    def gas_ppm(self) -> float:
+        """CHỈ DÙNG CHO GIẢ LẬP: quy đổi tuyến tính 0% -> 400 ppm, 50% -> 1000 ppm.
+        ESP32 thật phải tính ppm từ Rs/R0 theo đường cong hiệu chuẩn của TV1."""
+        return round(400 + self.pollution * 12 + random.uniform(-8, 8), 0)
+
+    @property
     def rs_ro_ratio(self) -> float:
         """MQ-135: không khí sạch Rs/R0 ~ 3.6 và giảm dần khi khí độc tăng."""
         return round(max(0.4, 3.6 - 0.03 * self.pollution) + random.uniform(-0.02, 0.02), 3)
 
     # ----------------------------- FSM ------------------------------
     def update_fan(self) -> bool:
-        """Trả về True nếu trạng thái quạt vừa thay đổi."""
-        if self.pollution >= 75.0 and not self.fan:                 # an toàn: ưu tiên cao nhất
-            return self._set_fan(1, "SAFETY_OVERRIDE", force=True)
-        if self.mode != "AUTO":
-            return False
-        should_on = self.pollution >= self.pollution_threshold or \
-            (self.pollution >= 28.0 and self.temperature >= self.temp_threshold)
-        should_off = self.pollution < 25.0 and self.temperature < 31.0
-        if should_on and not self.fan:
-            return self._set_fan(1, "FSM")
-        if should_off and self.fan:
-            return self._set_fan(0, "FSM")
-        return False
+        """FSM 3 mức theo ppm. Trả về True nếu tốc độ quạt vừa thay đổi.
 
-    def _set_fan(self, value: int, reason: str, force: bool = False) -> bool:
-        # Dwell time: giữ nguyên trạng thái tối thiểu 30 s để quạt không bật/tắt liên tục (chattering)
+        Nguyên tắc chống nảy công tắc (chattering):
+          * TĂNG tốc thì làm ngay: không khí xấu đi phải phản ứng tức thì
+          * GIẢM tốc thì phải chờ hết dwell time: tránh nhảy 50% <-> 100% liên tục
+            khi nồng độ dao động quanh mốc 1000 ppm
+        """
+        ppm = self.gas_ppm
+        level = "GOOD" if ppm < self.ppm_mid else "MID" if ppm <= self.ppm_bad else "BAD"
+        target = {"GOOD": 0, "MID": 50, "BAD": 100}[level]
+
+        if level == "BAD" and self.mode == "MANUAL" and self.speed < 100:
+            return self._set_speed(100, "SAFETY_OVERRIDE", force=True)   # an toàn trên hết
+        if self.mode != "AUTO" or target == self.speed:
+            return False
+        return self._set_speed(target, "FSM", force=target > self.speed)
+
+    def _set_speed(self, value: int, reason: str, force: bool = False) -> bool:
         if not force and self.t - self.last_change < self.dwell:
             return False
-        self.fan, self.reason, self.last_change = value, reason, self.t
+        self.speed, self.fan = value, 1 if value > 0 else 0
+        self.reason, self.last_change = reason, self.t
         return True
 
     # --------------------------- payload ----------------------------
@@ -113,7 +124,9 @@ class FakeKitchen:
             "device_id": device_id, "seq": self.seq, "timestamp": now_iso(),
             "temperature": self.temperature, "humidity": self.humidity,
             "pollution_percent": round(self.pollution, 1), "rs_ro_ratio": self.rs_ro_ratio,
-            "fan_state": self.fan, "mode": self.mode, "network_status": "CONNECTED",
+            "gas_ppm": self.gas_ppm,
+            "fan_state": self.fan, "fan_speed_percent": self.speed,
+            "mode": self.mode, "network_status": "CONNECTED",
         }
         if self.sensor_fault:
             # Đúng quy ước: cảm biến hỏng thì gửi null, KHÔNG gửi -1.
@@ -124,13 +137,14 @@ class FakeKitchen:
 
     def config_state(self, device_id: str) -> dict:
         """Ngưỡng FSM đang thực sự áp dụng - phát lại để Backend đối chiếu với CSDL."""
-        return {"device_id": device_id, "pollution_threshold": self.pollution_threshold,
+        return {"device_id": device_id,
                 "temp_threshold": self.temp_threshold, "dwell_time_seconds": self.dwell,
+                "ppm_mid_threshold": self.ppm_mid, "ppm_bad_threshold": self.ppm_bad,
                 "timestamp": now_iso()}
 
     def actuator_state(self, device_id: str) -> dict:
-        return {"device_id": device_id, "fan_state": self.fan, "mode": self.mode,
-                "reason": self.reason, "timestamp": now_iso()}
+        return {"device_id": device_id, "fan_state": self.fan, "fan_speed_percent": self.speed,
+                "mode": self.mode, "reason": self.reason, "timestamp": now_iso()}
 
 
 async def publish_loop(client: aiomqtt.Client, kitchen: FakeKitchen, device_id: str, interval: float) -> None:
@@ -139,8 +153,8 @@ async def publish_loop(client: aiomqtt.Client, kitchen: FakeKitchen, device_id: 
         if kitchen.update_fan():
             await client.publish(f"{PREFIX}/{device_id}/actuator/state",
                                  json.dumps(kitchen.actuator_state(device_id)), qos=1, retain=True)
-            print(f"[FSM] quạt -> {'BẬT' if kitchen.fan else 'TẮT'} ({kitchen.reason}), "
-                  f"P={kitchen.pollution:.1f}% T={kitchen.temperature:.1f}°C", flush=True)
+            print(f"[FSM] quạt -> {kitchen.speed}% ({kitchen.reason}), "
+                  f"{kitchen.gas_ppm:.0f} ppm T={kitchen.temperature:.1f}°C", flush=True)
         payload = kitchen.telemetry(device_id)
         if kitchen.drop_rate and random.random() < kitchen.drop_rate:
             # Cố tình KHÔNG gửi (seq vẫn tăng) -> Backend phải phát hiện được lỗ hổng
@@ -148,8 +162,8 @@ async def publish_loop(client: aiomqtt.Client, kitchen: FakeKitchen, device_id: 
             await asyncio.sleep(interval)
             continue
         await client.publish(f"{PREFIX}/{device_id}/telemetry", json.dumps(payload), qos=0)
-        print(f"[tx] P={payload['pollution_percent']:>5}% T={payload['temperature']:>5}°C "
-              f"H={payload['humidity']:>5}% quạt={payload['fan_state']} {kitchen.mode}", flush=True)
+        print(f"[tx] {payload['gas_ppm']:>5.0f} ppm T={payload['temperature']} H={payload['humidity']} "
+              f"quạt={payload['fan_speed_percent']}% {kitchen.mode}", flush=True)
         await asyncio.sleep(interval)
 
 
@@ -168,15 +182,18 @@ async def command_loop(client: aiomqtt.Client, kitchen: FakeKitchen, device_id: 
                 # Firmware thật cũng phải làm vậy: ở AUTO thì FSM giữ quyền quyết định
                 kitchen.reason = "IGNORED_AUTO_MODE"
             else:
-                kitchen.fan, kitchen.reason, kitchen.last_change = int(data["state"]), "MANUAL_COMMAND", kitchen.t
+                kitchen.fan = int(data["state"])
+                kitchen.speed = 100 if kitchen.fan else 0
+                kitchen.reason, kitchen.last_change = "MANUAL_COMMAND", kitchen.t
             await client.publish(f"{PREFIX}/{device_id}/actuator/state",
                                  json.dumps(kitchen.actuator_state(device_id)), qos=1, retain=True)
         elif topic.endswith("/mode/set"):
             kitchen.mode = data["mode"]
         elif topic.endswith("/config/set"):
-            kitchen.pollution_threshold = float(data.get("pollution_threshold", kitchen.pollution_threshold))
             kitchen.temp_threshold = float(data.get("temp_threshold", kitchen.temp_threshold))
             kitchen.dwell = float(data.get("dwell_time_seconds", kitchen.dwell))
+            kitchen.ppm_mid = float(data.get("ppm_mid_threshold", kitchen.ppm_mid))
+            kitchen.ppm_bad = float(data.get("ppm_bad_threshold", kitchen.ppm_bad))
             await client.publish(f"{PREFIX}/{device_id}/config/state",
                                  json.dumps(kitchen.config_state(device_id)), qos=1, retain=True)
 

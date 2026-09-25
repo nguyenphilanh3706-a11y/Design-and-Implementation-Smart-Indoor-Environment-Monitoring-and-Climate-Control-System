@@ -13,6 +13,7 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from .alert_service import AlertService
+from .air_quality import classify, fan_speed_for
 from .config import FRESH_MS, STALE_MS, Settings, topic
 from .db import Database
 from .mqtt_service import MqttService, MqttUnavailable
@@ -24,7 +25,8 @@ from .schemas import (ActuatorRequest, ActuatorResponse, AlertTestResponse, Conf
 
 router = APIRouter()
 
-DEVICE_FIELDS = ("pollution_threshold", "temp_threshold", "dwell_time_seconds")   # 3 trường ESP32 cần biết
+# Các tham số FSM mà ESP32 cần biết, đẩy xuống qua .../config/set. Từ v1.2 FSM chạy theo ppm.
+DEVICE_FIELDS = ("ppm_mid_threshold", "ppm_bad_threshold", "temp_threshold", "dwell_time_seconds")
 MAX_LIMIT = 5_000
 
 
@@ -94,6 +96,19 @@ async def get_status(db: DbDep, mqtt: MqttDep, alerts: AlertDep, settings: Setti
         freshness_ms = max(0, int((now - row["timestamp"]).total_seconds() * 1000))
         level = "FRESH" if freshness_ms < FRESH_MS else "DELAYED" if freshness_ms <= STALE_MS else "STALE"
 
+    # Thang chất lượng không khí theo ppm và tốc độ quạt tương ứng
+    cfg = await db.get_config(device)
+    gas_ppm = row["gas_ppm"] if row is not None else None
+    aq_level = (classify(gas_ppm, float(cfg["ppm_mid_threshold"]), float(cfg["ppm_bad_threshold"]))
+                if cfg else classify(gas_ppm))
+    speed, source = None, None
+    if row is not None and row["fan_speed_percent"] is not None:
+        speed, source = row["fan_speed_percent"], "device"          # ESP32 báo tốc độ thật
+    elif row is not None:
+        # Firmware chưa gửi tốc độ: AUTO thì suy ra từ mức ppm, MANUAL thì theo trạng thái bật/tắt
+        speed = fan_speed_for(aq_level) if row["mode"] == "AUTO" else (100 if row["fan_state"] == 1 else 0)
+        source = "derived" if speed is not None else None
+
     st = mqtt.device_status.get(device, {})
     return StatusResponse(
         device_id=device,
@@ -105,6 +120,7 @@ async def get_status(db: DbDep, mqtt: MqttDep, alerts: AlertDep, settings: Setti
         freshness_level=level,
         fan_state=row["fan_state"] if row is not None else None,
         mode=row["mode"] if row is not None else None,
+        gas_ppm=gas_ppm, air_quality=aq_level, fan_speed_percent=speed, fan_speed_source=source,
         active_alerts=alerts.active_alerts(device),
         config_in_sync=mqtt.config_in_sync.get(device),
         device_config=mqtt.device_config.get(device),
@@ -233,11 +249,18 @@ async def post_config(body: ConfigUpdate, db: DbDep, mqtt: MqttDep, alerts: Aler
     """Ngưỡng được lưu vào bảng `device_config` (còn nguyên sau khi khởi động lại) rồi mới publish
     xuống `.../config/set` (QoS 1, retain = true).
 
-    `pollution_threshold`, `temp_threshold`, `dwell_time_seconds` là tham số FSM của ESP32;
-    `alert_pollution_threshold`, `alert_temp_threshold` là ngưỡng bắn Telegram, chỉ Backend dùng.
+    `ppm_mid_threshold`, `ppm_bad_threshold`, `temp_threshold`, `dwell_time_seconds` là tham số FSM
+    của ESP32; `alert_ppm_threshold`, `alert_temp_threshold` là ngưỡng gửi Telegram, chỉ Backend dùng.
     """
     device = resolve_device(settings, device_id)
     fields = body.model_dump(exclude_none=True)
+    await db.ensure_config(device)
+    current = await db.get_config(device)
+    mid = fields.get("ppm_mid_threshold", current["ppm_mid_threshold"])
+    bad = fields.get("ppm_bad_threshold", current["ppm_bad_threshold"])
+    if mid >= bad:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            f"ppm_mid_threshold ({mid:g}) phải nhỏ hơn ppm_bad_threshold ({bad:g})")
     row = await db.update_config(device, fields, updated_by="api")
     config = DeviceConfig.model_validate(dict(row))
     alerts.set_thresholds(device, dict(row))   # áp dụng ngay cho bản tin telemetry kế tiếp

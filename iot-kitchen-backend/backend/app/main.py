@@ -133,13 +133,14 @@ async def health() -> HealthResponse:
 
     mqtt = "connected" if app.state.mqtt.connected else "disconnected"
     telegram = "configured" if app.state.settings.telegram_enabled else "not_configured"
+    discord = "configured" if app.state.settings.discord_enabled else "not_configured"
     ai_info = app.state.prediction.status()
     ai = ("disabled" if not ai_info["enabled"]
           else "ready" if ai_info["model_version"] and not ai_info["last_error"]
           else "no_model")
     ok = database == "connected" and mqtt == "connected"
     return HealthResponse(status="ok" if ok else "degraded", database=database, mqtt=mqtt,
-                          telegram=telegram, ai=ai)
+                          telegram=telegram, discord=discord, ai=ai)
 
 
 if WEB_DIR.is_dir() and any(WEB_DIR.iterdir()):

@@ -156,7 +156,7 @@ Lưu bằng Ctrl+O, Enter, rồi Ctrl+X.
 nano deploy/Caddyfile
 ```
 
-Dòng đầu tiên, thay `iot.ten-mien-cua-ban.com` thành `iot-kitchen-hcmute.duckdns.org`. Lưu như trên.
+Không cần sửa file này nữa. Tên miền đọc từ biến `SITE_DOMAIN` trong `.env`.
 
 ---
 

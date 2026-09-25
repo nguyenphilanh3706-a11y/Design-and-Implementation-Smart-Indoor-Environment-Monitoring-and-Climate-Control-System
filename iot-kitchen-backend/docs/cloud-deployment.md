@@ -131,7 +131,7 @@ thẳng vào.
 nano deploy/Caddyfile
 ```
 
-Thay `iot.ten-mien-cua-ban.com` ở dòng đầu bằng tên miền thật.
+Không cần sửa file này nữa. Tên miền đọc từ biến `SITE_DOMAIN` trong `.env`.
 
 ### 3.7 Mở tường lửa
 

@@ -7,16 +7,13 @@ TOPIC_PREFIX = "iot/kitchen"          # mục 2.1: iot/kitchen/{device_id}/...
 FRESH_MS = 3_000                      # mục 5.2: < 3 s  -> dữ liệu tươi (xanh)
 STALE_MS = 10_000                     # mục 5.2: > 10 s -> Stale Data (đỏ)
 
-
 def topic(device_id: str, suffix: str) -> str:
     """topic("esp32_kitchen_01", "telemetry") -> "iot/kitchen/esp32_kitchen_01/telemetry"."""
     return f"{TOPIC_PREFIX}/{device_id}/{suffix}"
 
-
 def _int(name: str, default: int) -> int:
     raw = os.getenv(name, "").strip()
     return int(raw) if raw else default
-
 
 @dataclass(frozen=True)
 class Settings:
@@ -42,6 +39,8 @@ class Settings:
     # Thời gian chờ ESP32 phản hồi actuator/state sau khi gửi lệnh
     command_ack_timeout_s: float = 3.0
 
+    # --- Kênh cảnh báo ---
+
     # --- MQTT qua Internet ---
     mqtt_tls: bool = False         # true khi dùng broker đám mây (HiveMQ) hoặc broker có chứng chỉ
     mqtt_ca_cert: str = ""         # để trống = dùng kho chứng chỉ gốc của hệ thống
@@ -49,6 +48,11 @@ class Settings:
     # --- Bảo mật khi mở ra Internet ---
     api_key: str = ""              # rỗng = không kiểm tra (chạy trong LAN)
     read_only: bool = False        # chặn mọi lệnh ghi
+
+    # --- Discord (kênh cảnh báo thứ hai, tuỳ chọn) ---
+    discord_webhook_url: str = ""     # để trống = không gửi Discord
+    discord_mention: str = ""         # VD "@everyone" hoặc "<@mã_người_dùng>" để điện thoại chắc chắn rung
+    discord_max_per_minute: int = 20  # Discord giới hạn khoảng 30 tin/phút mỗi kênh
 
     # --- Mô hình AI của TV5 (Tuần 2) ---
     ai_enabled: bool = True
@@ -61,6 +65,9 @@ class Settings:
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id)
 
+    @property
+    def discord_enabled(self) -> bool:
+        return self.discord_webhook_url.startswith(("https://", "http://"))
 
 def load_settings() -> Settings:
     return Settings(
@@ -76,9 +83,12 @@ def load_settings() -> Settings:
         device_id=os.getenv("DEVICE_ID", "esp32_kitchen_01"),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
-        alert_cooldown_s=_int("ALERT_COOLDOWN_SECONDS", 60),
-        alert_reminder_s=_int("ALERT_REMINDER_SECONDS", 300),
+        alert_cooldown_s=_int("ALERT_COOLDOWN_SECONDS", 600),
+        alert_reminder_s=_int("ALERT_REMINDER_SECONDS", 600),
         telegram_max_per_minute=_int("TELEGRAM_MAX_PER_MINUTE", 20),
+        discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
+        discord_mention=os.getenv("DISCORD_MENTION", "").strip(),
+        discord_max_per_minute=_int("DISCORD_MAX_PER_MINUTE", 20),
         mqtt_tls=os.getenv("MQTT_TLS", "false").strip().lower() in ("true", "1", "yes"),
         mqtt_ca_cert=os.getenv("MQTT_CA_CERT", "").strip(),
         api_key=os.getenv("API_KEY", "").strip(),
@@ -89,6 +99,5 @@ def load_settings() -> Settings:
         ai_window_size=_int("AI_WINDOW_SIZE", 20),
         ai_sample_seconds=_int("AI_SAMPLE_SECONDS", 10),
     )
-
 
 settings = load_settings()

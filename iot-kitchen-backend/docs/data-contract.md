@@ -1,4 +1,4 @@
-# HỢP ĐỒNG DỮ LIỆU (DATA CONTRACT) v1.1
+# HỢP ĐỒNG DỮ LIỆU (DATA CONTRACT) v1.2
 
 **Gửi: TV2 (firmware ESP32) và TV4 (Web Dashboard)** · **Từ: TV3 (Backend)** · Ngày 12/09/2026
 
@@ -41,11 +41,24 @@ Tiền tố: `iot/kitchen/{device_id}/` · `device_id` mặc định: `esp32_kit
   "humidity": 68.2,
   "pollution_percent": 22.4,
   "rs_ro_ratio": 2.91,
-  "fan_state": 0,
+  "gas_ppm": 1011,
+  "fan_state": 1,
+  "fan_speed_percent": 100,
   "mode": "AUTO",
   "network_status": "CONNECTED"
 }
 ```
+
+**🆕 v1.2 - `gas_ppm`** là nồng độ khí quy đổi từ Rs/R0 theo đường cong hiệu chuẩn MQ-135 của TV1.
+Đây là giá trị dùng cho FSM, cho cảnh báo Telegram và cho Dashboard. Phải tính **trong firmware** vì chỉ
+ESP32 có R0 đã hiệu chuẩn sau burn-in.
+
+**🆕 v1.2 - `fan_speed_percent`** là tốc độ quạt thật đang chạy: `0`, `50` hoặc `100`. Điều khiển
+bằng PWM trên GPIO25 qua MOSFET. `fan_state` giữ lại để tương thích: `0` khi tốc độ bằng 0, `1` khi
+lớn hơn 0.
+
+**Vẫn phải gửi `pollution_percent`.** Mô hình AI của TV5 được train bằng đơn vị phần trăm. Bỏ trường
+này thì phần dự báo ngừng hoạt động.
 
 Bốn điểm cần lưu ý:
 
@@ -69,6 +82,20 @@ kiện `SENSOR_FAULT`, các số đo còn lại trong bản tin vẫn được g
 (Rs chia R0), `pollution_percent` là giá trị đã quy đổi. Có cả hai thì mới chứng minh được quy trình
 burn-in và xác định R0 của TV1 trong báo cáo, thay vì chỉ nói suông.
 
+### 2.1b 🆕 v1.2 - FSM ba mức theo ppm
+
+| Mức | Nồng độ | Tốc độ quạt |
+|---|---|---|
+| GOOD | dưới `ppm_mid_threshold` (mặc định 800) | 0% |
+| MID | từ 800 đến `ppm_bad_threshold` (mặc định 1000) | 50% |
+| BAD | trên 1000 | 100% |
+
+Quy tắc chống nảy công tắc: **tăng tốc làm ngay**, vì không khí xấu đi phải phản ứng tức thì.
+**Giảm tốc phải chờ hết `dwell_time_seconds`**, để quạt không nhảy 50% và 100% liên tục khi nồng độ
+dao động quanh mốc.
+
+Ở chế độ MANUAL mà nồng độ lên BAD thì cưỡng bức 100%, báo `reason: SAFETY_OVERRIDE`.
+
 ### 2.2 `status` (kèm Last Will and Testament)
 
 ```json
@@ -84,6 +111,7 @@ LWT đăng ký lúc kết nối với `status: "OFFLINE"`, QoS 1, retain true. B
 {
   "device_id": "esp32_kitchen_01",
   "fan_state": 1,
+  "fan_speed_percent": 100,
   "mode": "MANUAL",
   "reason": "MANUAL_COMMAND",
   "timestamp": "2026-09-12T10:00:00.123Z"
@@ -112,7 +140,8 @@ Backend cũng chấp nhận key `state` thay cho `fan_state` để tương thíc
 ```json
 {
   "device_id": "esp32_kitchen_01",
-  "pollution_threshold": 40,
+  "ppm_mid_threshold": 800,
+  "ppm_bad_threshold": 1000,
   "temp_threshold": 33,
   "dwell_time_seconds": 30,
   "timestamp": "2026-09-12T10:00:00.123Z"
@@ -149,10 +178,12 @@ ESP32 chỉ thực hiện khi đang ở `MANUAL`. Đang ở `AUTO` thì bỏ qua
 ### 3.3 `config/set` (QoS 1, retain true)
 
 ```json
-{"pollution_threshold": 40, "temp_threshold": 33, "dwell_time_seconds": 30}
+{"ppm_mid_threshold": 800, "ppm_bad_threshold": 1000, "temp_threshold": 33, "dwell_time_seconds": 30}
 ```
 
-Đơn vị: phần trăm, độ C, **giây**. Web có thể chỉ gửi một trường; các trường không xuất hiện thì
+Đơn vị: **ppm**, độ C, **giây**. Bản tin chỉ chứa những trường vừa được thay đổi, các trường còn lại
+firmware giữ nguyên giá trị cũ. Trường `pollution_threshold` theo phần trăm của v1.1 không còn được
+gửi xuống thiết bị, vì FSM v1.2 chạy theo hai mốc ppm. Web có thể chỉ gửi một trường; các trường không xuất hiện thì
 giữ nguyên giá trị cũ, đừng đặt về mặc định. Nhận xong thì phát lại `config/state`.
 
 Nhờ retain true, ESP32 khởi động lại là nhận ngay ngưỡng mới nhất, không quay về giá trị nạp cứng

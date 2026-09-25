@@ -52,11 +52,12 @@ iot-kitchen-backend/
 │   ├── init/10_schema.sql      # 4 bảng + hypertable + chính sách xoá dữ liệu cũ
 │   └── migrations/             # thêm cột cho CSDL đã có dữ liệu, khỏi phải xoá đi làm lại
 ├── docs/
-│   ├── data-contract.md        # HỢP ĐỒNG DỮ LIỆU - gửi file này cho TV2 và TV4
+│   ├── data-contract.md        # HỢP ĐỒNG DỮ LIỆU v1.2 (ppm) - gửi file này cho TV2 và TV4
 │   ├── frontend-integration.md # hướng dẫn TV4 nối dashboard vào backend
 │   ├── ai-integration.md       # Tuần 2: tích hợp mô hình AI - gửi TV5
 │   ├── public-deployment.md    # mở tạm ra Internet bằng Cloudflare Tunnel
 │   ├── aws-deployment.md       # ĐƯA LÊN AWS EC2 chạy 24/7 (vùng Singapore, độ trễ ~50ms)
+│   ├── discord-alerts.md       # cảnh báo qua Discord, kênh thứ hai
 │   ├── gcp-deployment.md       # đưa lên Google Cloud (miễn phí vĩnh viễn, nhưng máy ở Mỹ)
 │   ├── cloud-deployment.md     # VPS nói chung (DigitalOcean, Oracle)
 │   └── railway-deployment.md   # Railway (4 service riêng, có TCP proxy)
@@ -72,6 +73,7 @@ iot-kitchen-backend/
 │   └── acl.template            # phân quyền theo từng tài khoản
 └── tools/
     ├── simulate_esp32.py       # ESP32 giả lập (có kịch bản khói)
+    ├── fake_discord.py         # Discord giả để thử khi chưa có webhook
     ├── fake_telegram.py        # Telegram giả để demo khi không có mạng
     ├── dashboard-demo.html     # trang demo kết nối - mở bằng trình duyệt là chạy
     ├── api.http                # bộ request bấm-là-chạy trong VSCode
@@ -269,7 +271,7 @@ Thứ tự nên thử:
 3. `POST /api/v1/kitchen/mode` với `{"mode": "MANUAL"}`
 4. `POST /api/v1/kitchen/actuator` với `{"state": 1}` → xem `rtt_ms` (số liệu Bài test 2)
 5. `GET /api/v1/kitchen/history?limit=20&order=desc`
-6. `POST /api/v1/kitchen/config` với `{"pollution_threshold": 35}`
+6. `POST /api/v1/kitchen/config` với `{"ppm_bad_threshold": 1100}`
 
 ### 5.2 Trong VSCode (không cần Postman)
 
@@ -305,7 +307,20 @@ Bốn endpoint ghi (`/actuator`, `/mode`, `/config`, `/alerts/test`) yêu cầu 
 Các endpoint đọc vẫn mở. Sai khoá quá 10 lần một phút thì bị chặn, mỗi lần từ chối đều ghi
 `AUTH_FAILED` kèm IP vào nhật ký.
 
-### 5.6 Chấm điểm firmware bằng một lệnh
+### 5.6 Xuất đồ thị số liệu cho báo cáo
+
+```powershell
+pip install matplotlib
+python tools\plot_measurements.py --api https://iot-kitchen-hcmute.duckdns.org
+```
+
+Script đọc dữ liệu thật từ REST API rồi vẽ 5 đồ thị vào thư mục `charts/`: độ trễ ghi dữ liệu,
+thời gian khứ hồi điều khiển, chống nảy công tắc, tỉ lệ mất gói, và sai số mô hình AI.
+
+Chỗ nào chưa đủ dữ liệu thì script in ra lý do và bỏ qua đồ thị đó, **không sinh số giả để bù**.
+Muốn có đủ thì chạy hệ thống vài giờ và bấm bật tắt quạt vài lần.
+
+### 5.7 Chấm điểm firmware bằng một lệnh
 
 ```powershell
 curl.exe "http://localhost:8000/api/v1/kitchen/diagnostics?minutes=10"
@@ -407,14 +422,14 @@ Chu kỳ 3 phút: 20 giây sạch → khói tăng dần → vượt 50% (**Teleg
 Cách nhanh hơn, không cần chờ: hạ ngưỡng xuống dưới mức hiện tại.
 
 ```powershell
-curl.exe -X POST http://localhost:8000/api/v1/kitchen/config -H "Content-Type: application/json" -d "{\"alert_pollution_threshold\": 10}"
+curl.exe -X POST http://localhost:8000/api/v1/kitchen/config -H "Content-Type: application/json" -d "{\"alert_ppm_threshold\": 100}"
 ```
 
-Nhớ trả về 50 sau khi thử xong.
+Nhớ trả về 1000 sau khi thử xong.
 
 ### 6.4 Chứng minh cơ chế chống spam
 
-Dữ liệu về mỗi 2 giây. Nếu ô nhiễm giữ ở 60% trong 1 phút mà gửi mỗi bản tin thì bạn nhận **30 tin**.
+Dữ liệu về mỗi 2 giây. Nếu nồng độ giữ ở 1200 ppm trong 10 phút mà gửi mỗi bản tin thì bạn nhận **300 tin**.
 Hệ thống này chỉ gửi **1 tin**. Kiểm chứng:
 
 ```powershell
@@ -426,9 +441,9 @@ Bốn tầng bảo vệ:
 | Cơ chế | Cách hoạt động | Tham số trong `.env` |
 |---|---|---|
 | Chỉ báo khi mới vượt ngưỡng | Chỉ gửi ở thời điểm *chuyển* từ bình thường sang vượt ngưỡng | — |
-| Dải trễ (hysteresis) | Chỉ coi là hết cảnh báo khi xuống dưới 45% (= 50 − 5) | cố định 5% |
-| Cooldown | 2 cảnh báo mới cùng loại cách nhau ≥ 60 giây | `ALERT_COOLDOWN_SECONDS` |
-| Nhắc lại | Vượt ngưỡng kéo dài thì 5 phút nhắc 1 lần | `ALERT_REMINDER_SECONDS` |
+| Dải trễ (hysteresis) | Chỉ coi là hết cảnh báo khi xuống dưới 950 ppm (= 1000 − 50) | cố định 50 ppm |
+| Cooldown | 2 đợt cảnh báo mới cùng loại cách nhau ≥ 10 phút | `ALERT_COOLDOWN_SECONDS=600` |
+| Nhắc lại | Vượt ngưỡng kéo dài thì 10 phút nhắc 1 lần | `ALERT_REMINDER_SECONDS=600` |
 | Trần tốc độ | Tối đa 20 tin/phút cho toàn hệ thống, hàng đợi 50 tin | `TELEGRAM_MAX_PER_MINUTE` |
 
 Ngoài ra khi Telegram trả lỗi 429 (quá tải), Backend đọc `retry_after` rồi chờ đúng số giây đó và gửi lại.
@@ -471,6 +486,7 @@ Trong `.env` đặt `TELEGRAM_BOT_TOKEN=123:FAKE`, `TELEGRAM_CHAT_ID=999`,
 | `mqtt: disconnected` trong `/health` | Sai `MQTT_BACKEND_PASSWORD` giữa Broker và Backend | Hai biến phải cùng giá trị trong `.env`; `docker compose up -d --force-recreate` |
 | Container mosquitto chết ngay | File cấu hình sai cú pháp | `docker compose logs mosquitto` xem dòng `Error: Unable to open...` |
 | Telegram `sent: false` | Chưa nhắn cho bot trước, hoặc sai chat_id | Xem `detail` trong response, làm lại mục 6.1 bước 4 |
+| Nhắc lại mỗi 5 phút thay vì 10 phút | File `.env` tạo từ bản cũ ghi `ALERT_REMINDER_SECONDS=300` | Sửa thành 600 rồi `--force-recreate backend` |
 | `POST` trả 401 `Thiếu hoặc sai header X-API-Key` | Đã đặt `API_KEY` trong `.env` | Gửi kèm header `X-API-Key`, hoặc bỏ trống `API_KEY` khi chạy trong LAN |
 | `POST` trả 403 `chế độ chỉ đọc` | `READ_ONLY=true` | Đổi thành `false` rồi `docker compose up -d --force-recreate backend` |
 | Dashboard báo lỗi CORS | Origin chưa được phép | Đặt `CORS_ORIGINS=http://localhost:5173` trong `.env` |
@@ -553,6 +569,8 @@ Chạy thật với PostgreSQL 16 + TimescaleDB 2.30.0, Mosquitto 2.1.2, FastAPI
 | Đo độ chính xác AI | Nạp 40 dự báo có sai số biết trước → API trả MAE 3,83 và RMSE 4,15, khớp chính xác giá trị tính tay |
 | Khoá API | Không khoá và khoá sai đều trả 401, khoá đúng qua được, sai 10 lần chuyển 429, ghi `AUTH_FAILED` kèm IP |
 | Chế độ chỉ đọc | `READ_ONLY=true` chặn lệnh ghi kể cả khi khoá đúng, endpoint đọc vẫn 200 |
+| Cảnh báo Telegram | Vượt 1000 ppm gửi đúng 1 tin "Ô nhiễm! ..., tôi sẽ bật quạt", dữ liệu về mỗi giây vẫn không spam, nhắc lại đúng chu kỳ 10 phút |
+| Ngưỡng ppm | FSM chuyển 50% ở 817 ppm và 100% ở 1023 ppm; đặt mốc MID lớn hơn BAD bị từ chối 422 |
 | Đồng hồ thiết bị sai | Gửi timestamp ở tương lai 4 giờ → lưu bằng giờ server, ghi `CLOCK_SKEW`, dữ liệu thật không bị che |
 
 ---

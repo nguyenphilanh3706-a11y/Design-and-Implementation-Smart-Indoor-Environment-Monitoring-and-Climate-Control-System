@@ -56,24 +56,33 @@ FROM telemetry
 WHERE time > now() - interval '1 hour';
 
 -- ---------------------------------------------------------------------
--- 4a. BÀI TEST 4 - TỶ LỆ MẤT GÓI TÍNH CHÍNH XÁC THEO seq
+-- 4a. BÀI TEST 4 - TỶ LỆ MẤT GÓI TÍNH THEO seq, CÓ GIỚI HẠN THEO THỜI GIAN
 --     Firmware đếm seq tăng 1 mỗi bản tin. Thiếu bao nhiêu số là mất bấy nhiêu gói,
---     không phải suy đoán. Kết quả này trùng với endpoint GET /diagnostics.
+--     nhưng mỗi lỗ hổng không được vượt quá số gói mà khoảng thời gian đó chứa được
+--     (chu kỳ 2 giây). Nhờ vậy một bản tin gửi tay mang seq bất thường không làm
+--     số liệu sai lệch. Kết quả trùng với endpoint GET /diagnostics.
 -- ---------------------------------------------------------------------
 WITH lien_tiep AS (
-    SELECT seq, lag(seq) OVER (ORDER BY time) AS seq_truoc
+    SELECT seq, time,
+           lag(seq)  OVER (ORDER BY time) AS seq_truoc,
+           lag(time) OVER (ORDER BY time) AS time_truoc
     FROM telemetry
     WHERE time > now() - interval '1 hour' AND seq IS NOT NULL
+), lo_hong AS (
+    SELECT seq, seq_truoc,
+           LEAST(seq - seq_truoc - 1,
+                 GREATEST(0, round(extract(epoch FROM time - time_truoc) / 2)::bigint - 1)) AS mat
+    FROM lien_tiep
+    WHERE seq_truoc IS NOT NULL
 )
-SELECT count(*)                                                             AS so_ban_ghi,
-       coalesce(sum(seq - seq_truoc - 1) FILTER (WHERE seq > seq_truoc + 1), 0) AS so_goi_mat,
-       count(*) FILTER (WHERE seq > seq_truoc + 1)                          AS so_lan_dut,
-       count(*) FILTER (WHERE seq < seq_truoc)                              AS so_lan_khoi_dong_lai,
-       round(100.0 * coalesce(sum(seq - seq_truoc - 1) FILTER (WHERE seq > seq_truoc + 1), 0)
-             / nullif(count(*) + coalesce(sum(seq - seq_truoc - 1)
-                      FILTER (WHERE seq > seq_truoc + 1), 0), 0), 2)        AS ty_le_mat_phan_tram
-FROM lien_tiep
-WHERE seq_truoc IS NOT NULL;
+SELECT count(*)                                                AS so_ban_ghi,
+       coalesce(sum(mat) FILTER (WHERE seq > seq_truoc + 1), 0) AS so_goi_mat,
+       count(*) FILTER (WHERE seq > seq_truoc + 1 AND mat > 0)  AS so_lan_dut,
+       count(*) FILTER (WHERE seq < seq_truoc)                  AS so_lan_khoi_dong_lai,
+       round(100.0 * coalesce(sum(mat) FILTER (WHERE seq > seq_truoc + 1), 0)
+             / nullif(count(*) + coalesce(sum(mat) FILTER (WHERE seq > seq_truoc + 1), 0), 0), 2)
+                                                               AS ty_le_mat_phan_tram
+FROM lo_hong;
 
 -- ---------------------------------------------------------------------
 -- 4b. CÁCH ƯỚC LƯỢNG CŨ - dùng khi firmware chưa gửi seq

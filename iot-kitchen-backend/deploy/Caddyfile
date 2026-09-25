@@ -8,10 +8,12 @@
 #    * Không dính lỗi chặn nội dung hỗn hợp: trang https gọi wss cùng miền
 #    * TV4 chỉ phải nhớ một địa chỉ thay vì hai tunnel
 #
-#  Thay iot.ten-mien-cua-ban.com bằng tên miền thật đã trỏ A record về IP máy chủ.
+#  Tên miền đọc từ biến SITE_DOMAIN trong .env, KHÔNG sửa tay ở đây.
+#  Lý do: file này nằm trong gói mã nguồn. Nếu ghi cứng tên miền vào đây thì mỗi lần
+#  giải nén bản mới đè lên, tên miền bị thay bằng bản mẫu và Caddy ngừng phục vụ.
 # =====================================================================
 
-iot.ten-mien-cua-ban.com {
+{$SITE_DOMAIN:localhost} {
 	encode gzip
 
 	# ---- MQTT over WebSockets cho Dashboard ----

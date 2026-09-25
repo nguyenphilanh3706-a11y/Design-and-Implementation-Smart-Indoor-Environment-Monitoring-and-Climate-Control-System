@@ -33,7 +33,9 @@ class TelemetryIn(BaseModel):
     humidity: float | None = Field(None, ge=0, le=100)
     pollution_percent: float | None = Field(None, ge=0, le=100)
     rs_ro_ratio: float | None = Field(None, ge=0, le=20)
+    gas_ppm: float | None = Field(None, ge=0, le=10000, description="Nồng độ khí MQ-135 quy đổi ra ppm (ESP32 tính)")
     fan_state: FanState | None = None
+    fan_speed_percent: int | None = Field(None, ge=0, le=100, description="Tốc độ quạt thiết bị báo về")
     mode: Mode | None = None
     network_status: str | None = None
 
@@ -55,6 +57,7 @@ RANGES: dict[str, tuple[float, float]] = {
     "humidity": (0.0, 100.0),
     "pollution_percent": (0.0, 100.0),
     "rs_ro_ratio": (0.0, 20.0),
+    "gas_ppm": (0.0, 10000.0),
 }
 
 
@@ -109,16 +112,18 @@ class ConfigStateIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     device_id: str | None = None
-    pollution_threshold: float | None = None
     temp_threshold: float | None = None
     dwell_time_seconds: float | None = None
+    ppm_mid_threshold: float | None = None
+    ppm_bad_threshold: float | None = None
     timestamp: datetime | None = None
 
     def as_dict(self) -> dict[str, float]:
         return {k: v for k, v in
-                (("pollution_threshold", self.pollution_threshold),
-                 ("temp_threshold", self.temp_threshold),
-                 ("dwell_time_seconds", self.dwell_time_seconds))
+                (("temp_threshold", self.temp_threshold),
+                 ("dwell_time_seconds", self.dwell_time_seconds),
+                 ("ppm_mid_threshold", self.ppm_mid_threshold),
+                 ("ppm_bad_threshold", self.ppm_bad_threshold))
                 if v is not None}
 
 
@@ -134,19 +139,34 @@ class ModeRequest(BaseModel):
 
 
 class ConfigUpdate(BaseModel):
-    """Chỉ cần gửi các trường muốn đổi. 3 trường đầu được gửi xuống ESP32, 2 trường alert_* chỉ Backend dùng."""
-    model_config = ConfigDict(json_schema_extra={"examples": [{"pollution_threshold": 40, "temp_threshold": 33}]})
+    """Chỉ cần gửi các trường muốn đổi.
 
-    pollution_threshold: float | None = Field(None, ge=0, le=100, description="Ngưỡng % ô nhiễm bật quạt (FSM)")
-    temp_threshold: float | None = Field(None, ge=0, le=100, description="Ngưỡng nhiệt độ °C (luật P ≥ 28% VÀ T ≥ ngưỡng)")
+    ppm_mid_threshold, ppm_bad_threshold, temp_threshold, dwell_time_seconds được đẩy xuống ESP32
+    qua .../config/set. Hai trường alert_* chỉ Backend dùng để quyết định gửi Telegram.
+
+    Từ v1.2 mọi ngưỡng ô nhiễm tính theo ppm. Hai trường cũ theo phần trăm (pollution_threshold,
+    alert_pollution_threshold) đã bỏ: gửi lên sẽ bị bỏ qua vì không còn tác dụng.
+    """
+    model_config = ConfigDict(extra="ignore", json_schema_extra={"examples": [
+        {"ppm_mid_threshold": 800, "ppm_bad_threshold": 1000, "alert_ppm_threshold": 1000}]})
+
+    temp_threshold: float | None = Field(None, ge=0, le=100, description="Ngưỡng nhiệt độ °C gửi xuống FSM")
     dwell_time_seconds: int | None = Field(None, ge=0, le=600, description="Thời gian khóa trạng thái quạt (giây)")
-    alert_pollution_threshold: float | None = Field(None, ge=0, le=100, description="Ngưỡng % ô nhiễm gửi Telegram")
-    alert_temp_threshold: float | None = Field(None, ge=0, le=100, description="Ngưỡng nhiệt độ °C gửi Telegram")
+    alert_temp_threshold: float | None = Field(None, ge=0, le=100, description="Ngưỡng nhiệt độ °C gửi cảnh báo")
+    ppm_mid_threshold: float | None = Field(None, gt=0, le=10000,
+                                            description="Từ mức này trở lên là MID, quạt 50% (mặc định 800)")
+    ppm_bad_threshold: float | None = Field(None, gt=0, le=10000,
+                                            description="Trên mức này là BAD, quạt 100% (mặc định 1000)")
+    alert_ppm_threshold: float | None = Field(None, gt=0, le=10000,
+                                              description="Trên mức này thì gửi cảnh báo Telegram (mặc định 1000)")
 
     @model_validator(mode="after")
     def _at_least_one_field(self):
         if not self.model_dump(exclude_none=True):
             raise ValueError("Cần gửi ít nhất 1 tham số cấu hình")
+        if self.ppm_mid_threshold is not None and self.ppm_bad_threshold is not None \
+                and self.ppm_mid_threshold >= self.ppm_bad_threshold:
+            raise ValueError("ppm_mid_threshold phải nhỏ hơn ppm_bad_threshold")
         return self
 
 
@@ -161,7 +181,9 @@ class TelemetryOut(BaseModel):
     humidity: float | None = None
     pollution_percent: float | None = None
     rs_ro_ratio: float | None = None
+    gas_ppm: float | None = None
     fan_state: int | None = None
+    fan_speed_percent: int | None = None
     mode: str | None = None
     network_status: str | None = None
 
@@ -177,6 +199,12 @@ class StatusResponse(BaseModel):
         description="FRESH < 3000 ms ≤ DELAYED ≤ 10000 ms < STALE")
     fan_state: int | None
     mode: str | None
+    gas_ppm: float | None = Field(None, description="Nồng độ khí mới nhất (ppm)")
+    air_quality: Literal["GOOD", "MID", "BAD"] | None = Field(
+        None, description="< 800 GOOD · 800-1000 MID · > 1000 BAD (mốc đổi được qua /config)")
+    fan_speed_percent: int | None = Field(None, description="0 / 50 / 100")
+    fan_speed_source: Literal["device", "derived"] | None = Field(
+        None, description="device: ESP32 báo về · derived: Backend suy ra từ mức ppm vì firmware chưa gửi")
     active_alerts: list[str]
     config_in_sync: bool | None = Field(
         description="Ngưỡng ESP32 báo về trên .../config/state có khớp bảng device_config không. "
@@ -221,12 +249,15 @@ class ModeResponse(BaseModel):
 
 
 class DeviceConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     device_id: str
-    pollution_threshold: float
     temp_threshold: float
     dwell_time_seconds: int
-    alert_pollution_threshold: float
     alert_temp_threshold: float
+    ppm_mid_threshold: float = 800
+    ppm_bad_threshold: float = 1000
+    alert_ppm_threshold: float = 1000
     updated_at: UtcDateTime
     updated_by: str
 
@@ -256,6 +287,7 @@ class HealthResponse(BaseModel):
     database: str
     mqtt: str
     telegram: str
+    discord: str = Field("not_configured", description="configured · not_configured")
     ai: str = Field(description="ready · no_model · disabled")
 
 

@@ -26,7 +26,9 @@ log = logging.getLogger("mqtt")
 
 MAX_PAST_SKEW = timedelta(hours=24)    # gửi bù sau khi mất mạng -> vẫn nhận
 MAX_FUTURE_SKEW = timedelta(seconds=60)  # đồng hồ thiết bị chạy nhanh -> không nhận (xem _sample_time)
-DEVICE_CONFIG_FIELDS = ("pollution_threshold", "temp_threshold", "dwell_time_seconds")
+# Chỉ đối chiếu các tham số FSM ppm đang dùng. pollution_threshold (%) của v1.1 đã bỏ khỏi FSM,
+# nếu vẫn bắt buộc thì firmware mới không báo trường đó sẽ bị coi là lệch ngưỡng mãi.
+DEVICE_CONFIG_FIELDS = ("ppm_mid_threshold", "ppm_bad_threshold", "temp_threshold", "dwell_time_seconds")
 
 
 class MqttUnavailable(RuntimeError):
