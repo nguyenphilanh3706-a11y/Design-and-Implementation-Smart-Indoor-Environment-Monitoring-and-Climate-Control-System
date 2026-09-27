@@ -1,20 +1,3 @@
-"""
-DỊCH VỤ CẢNH BÁO QUA TELEGRAM - miễn phí, không giới hạn số tin.
-
-Luồng:  telemetry -> TẦNG 1 kiểm tra ngưỡng -> hàng đợi -> TẦNG 2 worker gửi -> nhật ký
-
-Khi nào gửi:
-  * Nồng độ khí VƯỢT 1000 ppm (mốc BAD)  -> "Ô nhiễm! ..., tôi sẽ bật quạt."
-  * Nhiệt độ VƯỢT 40°C                    -> "Nhiệt độ cao! ..."
-  Hai ngưỡng lưu trong bảng device_config, đổi được qua POST /config.
-
-Chống spam:
-  * Chỉ gửi khi MỚI vượt ngưỡng (edge-trigger), không gửi lại mỗi 2 giây
-  * Dải trễ (hysteresis): ô nhiễm phải xuống dưới 950 ppm mới coi là hết, tránh
-    dao động quanh 1000 ppm làm bắn tin liên tục
-  * Cooldown + nhắc lại cùng 10 phút: mỗi loại cảnh báo tối đa 1 tin / 10 phút
-  * Trần toàn hệ thống TELEGRAM_MAX_PER_MINUTE (mặc định 20, Telegram giới hạn 30)
-"""
 import asyncio
 import contextlib
 import html
@@ -163,35 +146,286 @@ def build_telegram(kind: str, rule: AlertRule, device_id: str, t: TelemetryIn,
 class TelegramNotifier:
     name = "telegram"
 
-    def __init__(self, s: Settings, http: httpx.AsyncClient):
-        self.s, self.http = s, http
-        self.limiter = SlidingWindowLimiter(s.telegram_max_per_minute)
+    def __init__(
+        self,
+        s: Settings,
+        http: httpx.AsyncClient,
+    ):
+        self.s = s
+        self.http = http
+
+        self.limiter = SlidingWindowLimiter(
+            s.telegram_max_per_minute
+        )
 
     @property
     def enabled(self) -> bool:
-        return self.s.telegram_enabled
+        return bool(
+            self.s.telegram_bot_token.strip()
+            and self.s.telegram_chat_id.strip()
+        )
 
-    async def send(self, text: str) -> SendResult:
+    # ---------------------------------------------------------
+    # Kiem tra token + chat_id
+    # ---------------------------------------------------------
+    async def verify(self) -> SendResult:
+
         if not self.enabled:
-            return SendResult("skipped", "Telegram chưa cấu hình")
-        await self.limiter.acquire()
-        url = f"{TELEGRAM_API}/bot{self.s.telegram_bot_token}/sendMessage"
-        body = {"chat_id": self.s.telegram_chat_id, "text": text, "parse_mode": "HTML"}
-        for attempt in (1, 2):
-            try:
-                resp = await self.http.post(url, json=body)
-                data = resp.json()
-            except (httpx.HTTPError, ValueError) as exc:
-                return SendResult("failed", f"Lỗi kết nối tới Telegram ({type(exc).__name__})")
-            if data.get("ok"):
-                return SendResult("sent", f"Đã gửi Telegram (message_id={data['result']['message_id']})")
-            retry_after = (data.get("parameters") or {}).get("retry_after")
-            if resp.status_code == 429 and retry_after and attempt == 1:
-                await asyncio.sleep(min(float(retry_after), 60))
-                continue
-            return SendResult("failed", f"Telegram từ chối: {data.get('description', resp.status_code)}")
-        return SendResult("failed", "Telegram vẫn quá tải sau khi thử lại")
+            return SendResult(
+                "skipped",
+                "TELEGRAM_BOT_TOKEN hoac TELEGRAM_CHAT_ID chua duoc cau hinh",
+            )
 
+        token = self.s.telegram_bot_token.strip()
+        chat_id = self.s.telegram_chat_id.strip()
+
+        # 1. Kiem tra BOT TOKEN
+        try:
+            resp = await self.http.get(
+                f"{TELEGRAM_API}/bot{token}/getMe"
+            )
+
+            data = resp.json()
+
+        except Exception as exc:
+            return SendResult(
+                "failed",
+                f"Khong ket noi duoc Telegram getMe: "
+                f"{type(exc).__name__}: {exc}",
+            )
+
+        if not data.get("ok"):
+            return SendResult(
+                "failed",
+                "Telegram BOT_TOKEN khong hop le: "
+                f"{data.get('description', resp.status_code)}",
+            )
+
+        bot_username = (
+            data.get("result", {})
+            .get("username", "unknown")
+        )
+
+        # 2. Kiem tra CHAT_ID
+        try:
+            resp = await self.http.get(
+                f"{TELEGRAM_API}/bot{token}/getChat",
+                params={
+                    "chat_id": chat_id
+                },
+            )
+
+            chat_data = resp.json()
+
+        except Exception as exc:
+            return SendResult(
+                "failed",
+                f"Khong kiem tra duoc Telegram CHAT_ID: "
+                f"{type(exc).__name__}: {exc}",
+            )
+
+        if not chat_data.get("ok"):
+            return SendResult(
+                "failed",
+                "Telegram CHAT_ID khong truy cap duoc: "
+                f"{chat_data.get('description', resp.status_code)}",
+            )
+
+        return SendResult(
+            "sent",
+            f"Telegram OK - bot=@{bot_username}, chat_id={chat_id}",
+        )
+
+    # ---------------------------------------------------------
+    # Gui message
+    # ---------------------------------------------------------
+    async def send(
+        self,
+        text: str,
+    ) -> SendResult:
+
+        if not self.enabled:
+
+            return SendResult(
+                "skipped",
+                "Telegram chua cau hinh "
+                "(thieu BOT_TOKEN hoac CHAT_ID)",
+            )
+
+        await self.limiter.acquire()
+
+        token = (
+            self.s.telegram_bot_token.strip()
+        )
+
+        chat_id = (
+            self.s.telegram_chat_id.strip()
+        )
+
+        url = (
+            f"{TELEGRAM_API}/bot"
+            f"{token}/sendMessage"
+        )
+
+        body = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+
+        # Thu toi da 2 lan
+        for attempt in range(1, 3):
+
+            try:
+
+                # Telegram Bot API chap nhan JSON; dung JSON de payload ro rang va on dinh.
+                resp = await self.http.post(
+                    url,
+                    json=body,
+                )
+
+            except httpx.HTTPError as exc:
+
+                log.error(
+                    "Telegram network error: %s",
+                    exc,
+                )
+
+                return SendResult(
+                    "failed",
+                    "Loi ket noi Telegram: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+
+            try:
+
+                data = resp.json()
+
+            except ValueError:
+
+                log.error(
+                    "Telegram response khong phai JSON: "
+                    "HTTP %s | %s",
+                    resp.status_code,
+                    resp.text[:300],
+                )
+
+                return SendResult(
+                    "failed",
+                    f"Telegram response invalid "
+                    f"(HTTP {resp.status_code})",
+                )
+
+            # -------------------------------------------------
+            # Thanh cong
+            # -------------------------------------------------
+            if (
+                resp.status_code == 200
+                and data.get("ok")
+            ):
+
+                message_id = (
+                    data.get("result", {})
+                    .get("message_id")
+                )
+
+                log.info(
+                    "Telegram ALERT sent | "
+                    "chat_id=%s | message_id=%s",
+                    chat_id,
+                    message_id,
+                )
+
+                return SendResult(
+                    "sent",
+                    "Da gui Telegram"
+                    + (
+                        f" (message_id={message_id})"
+                        if message_id
+                        else ""
+                    ),
+                )
+
+            # -------------------------------------------------
+            # Rate limit 429
+            # -------------------------------------------------
+            retry_after = (
+                data.get(
+                    "parameters",
+                    {},
+                )
+                .get(
+                    "retry_after"
+                )
+            )
+
+            if (
+                resp.status_code == 429
+                and retry_after
+                and attempt == 1
+            ):
+
+                wait_s = min(
+                    float(retry_after),
+                    60.0,
+                )
+
+                log.warning(
+                    "Telegram rate limit, "
+                    "thu lai sau %.1fs",
+                    wait_s,
+                )
+
+                await asyncio.sleep(
+                    wait_s
+                )
+
+                continue
+
+            # -------------------------------------------------
+            # Loi token
+            # -------------------------------------------------
+            if resp.status_code == 401:
+
+                return SendResult(
+                    "failed",
+                    "TELEGRAM_BOT_TOKEN sai "
+                    "hoac bot token da bi revoke",
+                )
+
+            # -------------------------------------------------
+            # Chat ID sai / bot chua vao group
+            # -------------------------------------------------
+            if resp.status_code in (
+                400,
+                403,
+            ):
+
+                description = data.get(
+                    "description",
+                    "unknown error",
+                )
+
+                return SendResult(
+                    "failed",
+                    "Telegram khong gui duoc: "
+                    f"{description}. "
+                    "Kiem tra CHAT_ID, /start, "
+                    "hoac bot da duoc them vao group chua.",
+                )
+
+            return SendResult(
+                "failed",
+                "Telegram tu choi: "
+                f"HTTP {resp.status_code} - "
+                f"{data.get('description', resp.text[:200])}",
+            )
+
+        return SendResult(
+            "failed",
+            "Telegram gui that bai sau 2 lan thu",
+        )
 
 # Màu thẻ Discord theo loại tin
 DISCORD_COLORS = {"ALERT": 0xE53935, "REMINDER": 0xFB8C00, "RESOLVED": 0x43A047, "TEST": 0x1E88E5}
@@ -307,13 +541,45 @@ class AlertService:
 
     async def start(self) -> None:
         self._http = httpx.AsyncClient(timeout=15.0)
-        self.notifiers.append(TelegramNotifier(self.s, self._http))
-        if self.s.discord_enabled:                 # chỉ thêm khi đã điền webhook, khỏi ghi sự kiện bỏ qua thừa
+
+        # Tranh nhan doi notifier neu start() vo tinh duoc goi lai.
+        self.notifiers.clear()
+
+        # -------------------------------------------------------------
+        # Telegram: luon them vao danh sach de endpoint /alerts/test
+        # co the bao ro "skipped" neu thieu TOKEN/CHAT_ID.
+        # Dong thoi verify ngay luc startup de biet loi cau hinh som.
+        # -------------------------------------------------------------
+        telegram = TelegramNotifier(self.s, self._http)
+        self.notifiers.append(telegram)
+
+        if telegram.enabled:
+            check = await telegram.verify()
+            if check.ok:
+                log.info("Kenh canh bao TELEGRAM: %s", check.detail)
+            else:
+                log.error("TELEGRAM CONFIG ERROR: %s", check.detail)
+        else:
+            log.warning(
+                "Kenh TELEGRAM CHUA BAT: BOT_TOKEN=%s, CHAT_ID=%s",
+                "SET" if self.s.telegram_bot_token else "EMPTY",
+                "SET" if self.s.telegram_chat_id else "EMPTY",
+            )
+
+        # -------------------------------------------------------------
+        # Discord: chi them khi co webhook hop le.
+        # -------------------------------------------------------------
+        if self.s.discord_enabled:
             self.notifiers.append(DiscordNotifier(self.s, self._http))
-        self._worker = asyncio.create_task(self._worker_loop(), name="alert-worker")
-        for n in self.notifiers:
-            log.info("Kênh cảnh báo %s: %s", n.name.upper(),
-                     "đã cấu hình" if n.enabled else "CHƯA cấu hình -> chỉ ghi vào system_events")
+            log.info("Kenh canh bao DISCORD: da cau hinh")
+        else:
+            log.info("Kenh canh bao DISCORD: chua cau hinh")
+
+        # Khoi dong worker sau khi da kiem tra cac kenh.
+        self._worker = asyncio.create_task(
+            self._worker_loop(),
+            name="alert-worker",
+        )
 
     async def stop(self) -> None:
         if self._worker:
@@ -401,17 +667,50 @@ class AlertService:
     async def _worker_loop(self) -> None:
         while True:
             job = await self._queue.get()
+
             try:
+                # Moi kenh duoc xu ly doc lap. Loi Telegram khong duoc
+                # lam Discord mat tin, va nguoc lai.
                 for n in self.notifiers:
-                    result = await n.send(job[n.name])
-                    await self._log_result(job["device_id"], n.name, result,
-                                           f"[{job['kind']}] {job['rule']}", "backend",
-                                           {**job["details"], "channel": n.name},
-                                           critical=job["kind"] != "RESOLVED")
+                    try:
+                        result = await n.send(job[n.name])
+
+                        await self._log_result(
+                            job["device_id"],
+                            n.name,
+                            result,
+                            f"[{job['kind']}] {job['rule']}",
+                            "backend",
+                            {**job["details"], "channel": n.name},
+                            critical=job["kind"] != "RESOLVED",
+                        )
+
+                    except asyncio.CancelledError:
+                        raise
+
+                    except Exception as exc:
+                        # Khong de mot kenh bi loi lam dung vong lap
+                        # truoc khi kenh con lai duoc gui.
+                        log.exception(
+                            "Loi khi gui canh bao qua %s: %s",
+                            n.name.upper(),
+                            exc,
+                        )
+
+                        with contextlib.suppress(Exception):
+                            await self.db.log_event(
+                                job["device_id"],
+                                "ALERT_FAILED",
+                                f"[{job['kind']}] {job['rule']} qua {n.name.upper()}: "
+                                f"{type(exc).__name__}: {exc}",
+                                "WARNING",
+                                "backend",
+                                {**job["details"], "channel": n.name},
+                            )
+
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                log.exception("Lỗi không mong muốn trong worker cảnh báo")
+
             finally:
                 self._queue.task_done()
 

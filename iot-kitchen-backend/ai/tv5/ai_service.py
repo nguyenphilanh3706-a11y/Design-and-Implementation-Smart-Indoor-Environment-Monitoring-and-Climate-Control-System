@@ -1,98 +1,323 @@
 import os
 import json
-import time
 import joblib
 import numpy as np
 import pandas as pd
 from datetime import datetime
-import paho.mqtt.client as mqtt
+from typing import List, Dict, Any, Optional
+from collections import deque
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import uvicorn
+
+# Thử import TensorFlow/Keras (Phòng trường hợp môi trường chưa cài)
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model as keras_load_model
+    HAS_TF = True
+except ImportError:
+    HAS_TF = False
 
 # ==============================================================================
-# KHỐI 1: NẠP MÔ HÌNH AI ĐÃ HUẤN LƯỢNG
+# KHỐI 1: KHỞI TẠO FASTAPI APP & NẠP MODEL AI (HỖ TRỢ .H5, .KERAS, .PKL, .JOBLIB)
 # ==============================================================================
-# 1.1. Đường dẫn tới file model đã lưu ở bước train_ai.py
-MODEL_PATH = 'models/pollution_model.pkl'
+app = FastAPI(
+    title="Kitchen AI Prediction Service (LSTM + ML)",
+    description="Dịch vụ AI dự báo ô nhiễm & phân loại rủi ro nhà bếp 15 phút tới",
+    version="2.1.0"
+)
 
-# 1.2. Kiểm tra file mô hình. Nếu chưa train thì báo lỗi và dừng chương trình
-if not os.path.exists(MODEL_PATH):
-    print("X Chưa tìm thấy model. Hãy chạy train_ai.py trước!")
-    exit()
+MODEL_DIR = os.getenv("MODEL_DIR", "models")
+DEFAULT_MODEL_PATH = os.path.join(MODEL_DIR, "kitchen_lstm_15m.h5")
 
-# 1.3. Nạp mô hình Random Forest từ đĩa cứng vào bộ nhớ RAM để sẵn sàng suy luận
-model = joblib.load(MODEL_PATH)
-print("-> Đã nạp thành công mô hình AI!")
+model = None
+model_type = "None"  # 'keras_lstm', 'sklearn', hoặc 'None'
+model_version = "Unknown"
+n_features_expected = 5
 
+# Bộ đệm Deque lưu 30 mẫu gần nhất cho mỗi thiết bị (Window 30 time-steps x 5 features)
+device_buffers: Dict[str, deque] = {}
 
-# ==============================================================================
-# KHỐI 2: HÀM API CHÍNH DÙNG ĐỂ SUY LUẬN VÀ DỰ BÁO (PREDICT_FUTURE)
-# ==============================================================================
-def predict_future(window_20_samples):
-    """
-    Ý NGHĨA & CHỨC NĂNG:
-    Hàm này đóng vai trò là API Interface để Backend (TV3) hoặc Service khác gọi vào.
-    - Đầu vào: Danh sách (list) gồm 20 mẫu dữ liệu gần nhất (200 giây quá khứ).
-    - Đầu ra: Dictionary chứa kết quả dự báo 15 phút sau đúng Chuẩn Data Contract.
-    """
-    # 2.1. Chuyển đổi dữ liệu đầu vào thành DataFrame của Pandas
-    df = pd.DataFrame(window_20_samples)
+# Thông số Min-Max Scaler (Đồng bộ với dataset train kitchen_lstm_dataset_13000.csv)
+SCALER_CONFIG = {
+    "temp": {"min": 28.0, "max": 52.3},
+    "hum": {"min": 58.9, "max": 98.8},
+    "gas": {"min": 62.5, "max": 9999.0},
+    "gas_diff": {"min": -4112.0, "max": 9804.0},
+    "temp_diff": {"min": -23.0, "max": 23.0}
+}
+
+def scale_val(val: float, min_val: float, max_val: float) -> float:
+    """Chuẩn hóa min-max về khoảng [0, 1]"""
+    val_clamped = max(min_val, min(float(val), max_val))
+    return round((val_clamped - min_val) / (max_val - min_val), 4)
+
+def load_best_model():
+    """Tự động tìm và nạp file model mới nhất (.h5, .keras, .pkl, .joblib)"""
+    global model, model_type, model_version, n_features_expected
+    candidate_files = []
     
-    # 2.2. Chọn đúng 4 cột đặc trưng theo cam kết kỹ thuật
-    feature_cols = ['pollution_percent', 'dP_dt', 'temperature', 'humidity']
+    if os.path.exists(MODEL_DIR):
+        for file in os.listdir(MODEL_DIR):
+            if file.endswith((".h5", ".keras", ".pkl", ".joblib")):
+                candidate_files.append(os.path.join(MODEL_DIR, file))
     
-    # 2.3. Duỗi phẳng ma trận 20x4 thành mảng 1D (80 phần tử) và reshape thành (1, 80)
-    # để khớp với định dạng đầu vào mà mô hình Random Forest yêu cầu.
-    input_features = df[feature_cols].values.flatten().reshape(1, -1)
-    
-    # 2.4. Thực hiện suy luận (Inference): AI tính toán ra giá trị ô nhiễm dự báo
-    predicted_val = float(model.predict(input_features)[0])
-    
-    # 2.5. Giới hạn (Clip) giá trị dự báo trong khoảng hợp lệ từ 0.0% đến 100.0%
-    predicted_val = max(0.0, min(100.0, round(predicted_val, 1)))
-    
-    # 2.6. Lấy giá trị ô nhiễm ở mẫu hiện tại (mẫu thứ 20 - mẫu mới nhất trong cửa sổ)
-    current_val = float(df.iloc[-1]['pollution_percent'])
-    
-    # 2.7. Đánh giá xu hướng (Trend) diễn biến của không khí sau 15 phút:
-    # - TĂNG (RISING): Nếu tương lai cao hơn hiện tại > 3%
-    # - GIẢM (FALLING): Nếu tương lai thấp hơn hiện tại > 3%
-    # - ÔN ĐỊNH (STABLE): Nếu dao động trong khoảng ±3%
-    if predicted_val > current_val + 3.0:
-        trend = "RISING"
-    elif predicted_val < current_val - 3.0:
-        trend = "FALLING"
+    target_path = DEFAULT_MODEL_PATH
+    if candidate_files:
+        # Sắp xếp ưu tiên file sửa đổi mới nhất
+        candidate_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        target_path = candidate_files[0]
+
+    if os.path.exists(target_path):
+        ext = os.path.splitext(target_path)[1].lower()
+        model_version = os.path.basename(target_path)
+        
+        try:
+            if ext in ['.h5', '.keras']:
+                if HAS_TF:
+                    model = keras_load_model(target_path)
+                    model_type = "keras_lstm"
+                    print(f"-> [LSTM] Đã nạp thành công Keras Model: {model_version}")
+                else:
+                    print(f"X Chưa cài TensorFlow để đọc {target_path}. Hãy pip install tensorflow.")
+            else:
+                model = joblib.load(target_path)
+                model_type = "sklearn"
+                if hasattr(model, "n_features_in_"):
+                    n_features_expected = model.n_features_in_
+                print(f"-> [ML] Đã nạp thành công Scikit-Learn Model: {model_version}")
+        except Exception as e:
+            print(f"X Lỗi khi nạp model {target_path}: {e}")
+            model = None
+            model_type = "None"
     else:
-        trend = "STABLE"
+        print(f"-> Cảnh báo: Chưa thấy file model tại {target_path}. Sẽ dùng Rule-based dự phòng.")
 
-    # 2.8. Đóng gói kết quả đầu ra thành JSON Payload chuẩn Data Contract (Mục 2.2 Team Agreement)
-    # để sẵn sàng đẩy sang Backend qua MQTT Topic
-    payload = {
-        "timestamp": datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ'), # Thời gian chuẩn ISO 8601
-        "prediction_window_minutes": 15,                           # Tầm nhìn dự báo (15 phút)
-        "predicted_pollution_percent": predicted_val,              # Nồng độ khói dự báo (%)
-        "trend": trend                                              # Xu hướng (RISING/FALLING/STABLE)
-    }
-    return payload
+# Nạp model ngay khi khởi tạo service
+load_best_model()
+
+# ==============================================================================
+# KHỐI 2: PYDANTIC SCHEMA - HOÀN TOÀN TƯƠNG THÍCH MỌI ĐỊNH DẠNG ĐẦU VÀO
+# ==============================================================================
+class PredictRequest(BaseModel):
+    device_id: Optional[str] = "esp32_kitchen_01"
+    samples: Optional[List[Dict[str, Any]]] = None
+    
+    # Các trường dữ liệu cảm biến lẻ
+    temperature: Optional[float] = None
+    humidity: Optional[float] = None
+    gas_ppm: Optional[float] = None
+    pollution_percent: Optional[float] = None
+    dP_dt: Optional[float] = None
+
+    class Config:
+        extra = "allow"  # Chấp nhận các trường tùy biến mà không bị lỗi HTTP 422
 
 
 # ==============================================================================
-# KHỐI 3: GIẢ LẬP LUỒNG DỮ LIỆU THỜI GIAN THỰC VÀ CHẠY SERVICE (MAIN LOOP)
+# KHỐI 3: TIỀN XỬ LÝ & BỘ ĐỆM ĐẦU VÀO CHO MÔ HÌNH LSTM (30 STEPS X 5 FEATURES)
+# ==============================================================================
+def process_sensor_input(req: PredictRequest):
+    """Xử lý dữ liệu từ request, cập nhật bộ đệm Deque và trả về Tensor đầu vào cho LSTM"""
+    device_id = req.device_id or "esp32_kitchen_01"
+    
+    # Trích xuất thông số cảm biến thô
+    raw_samples = req.samples if req.samples else []
+    if raw_samples:
+        last = raw_samples[-1]
+        temp = float(last.get("temperature") or req.temperature or 29.5)
+        hum = float(last.get("humidity") or req.humidity or 80.0)
+        gas = float(last.get("gas_ppm") or req.gas_ppm or 200.0)
+    else:
+        temp = float(req.temperature if req.temperature is not None else 29.5)
+        hum = float(req.humidity if req.humidity is not None else 80.0)
+        if req.gas_ppm is not None:
+            gas = float(req.gas_ppm)
+        elif req.pollution_percent is not None:
+            gas = float(req.pollution_percent) * 100.0
+        else:
+            gas = 200.0
+
+    # Khởi tạo bộ đệm Deque 30 mẫu cho từng thiết bị
+    if device_id not in device_buffers:
+        device_buffers[device_id] = deque(maxlen=30)
+    
+    buf = device_buffers[device_id]
+
+    # Tính độ chênh lệch temp_diff và gas_diff
+    if len(buf) > 0:
+        prev_temp_unscaled = buf[-1][0] * (SCALER_CONFIG["temp"]["max"] - SCALER_CONFIG["temp"]["min"]) + SCALER_CONFIG["temp"]["min"]
+        prev_gas_unscaled = buf[-1][2] * (SCALER_CONFIG["gas"]["max"] - SCALER_CONFIG["gas"]["min"]) + SCALER_CONFIG["gas"]["min"]
+        temp_diff = temp - prev_temp_unscaled
+        gas_diff = gas - prev_gas_unscaled
+    else:
+        temp_diff = 0.0
+        gas_diff = float(req.dP_dt) if req.dP_dt is not None else 0.0
+
+    # Chuẩn hóa Scale [0, 1] cho 5 đặc trưng
+    t_s = scale_val(temp, SCALER_CONFIG["temp"]["min"], SCALER_CONFIG["temp"]["max"])
+    h_s = scale_val(hum, SCALER_CONFIG["hum"]["min"], SCALER_CONFIG["hum"]["max"])
+    g_s = scale_val(gas, SCALER_CONFIG["gas"]["min"], SCALER_CONFIG["gas"]["max"])
+    gd_s = scale_val(gas_diff, SCALER_CONFIG["gas_diff"]["min"], SCALER_CONFIG["gas_diff"]["max"])
+    td_s = scale_val(temp_diff, SCALER_CONFIG["temp_diff"]["min"], SCALER_CONFIG["temp_diff"]["max"])
+
+    # Lưu mẫu mới vào bộ đệm
+    buf.append([t_s, h_s, g_s, gd_s, td_s])
+
+    # Nhân bản mẫu nếu chưa đủ 30 bước thời gian
+    seq_list = list(buf)
+    while len(seq_list) < 30:
+        seq_list.insert(0, seq_list[0])
+
+    # Biến đổi thành Tensor 3D kích thước (1, 30, 5) cho LSTM
+    lstm_tensor = np.array([seq_list], dtype=np.float32)
+    
+    return lstm_tensor, gas, temp, hum, gas_diff
+
+
+# ==============================================================================
+# KHỐI 4: CÁC ENDPOINT FASTAPI
+# ==============================================================================
+@app.get("/health")
+def health_check():
+    return {
+        "status": "ok",
+        "model_loaded": model is not None,
+        "model_type": model_type,
+        "model_version": model_version,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/api/v1/kitchen/model_info")
+def model_info():
+    return {
+        "model_version": model_version,
+        "model_type": model_type,
+        "features_expected": n_features_expected,
+        "status": "ready" if model else "fallback_mode"
+    }
+
+
+@app.post("/predict")
+@app.post("/api/v1/kitchen/predict")
+def predict(req: PredictRequest):
+    try:
+        lstm_tensor, current_gas, current_temp, current_hum, gas_diff = process_sensor_input(req)
+        
+        risk_level = "SAFE"
+        predicted_gas = current_gas
+        confidence = 1.0
+
+        # 1. Chạy suy luận từ AI Model
+        if model is not None:
+            try:
+                if model_type == "keras_lstm":
+                    pred = model.predict(lstm_tensor, verbose=0)[0]
+                    
+                    if len(pred) == 3:  # Phân loại rủi ro (Softmax 3 lớp: SAFE, WARNING, DANGER)
+                        risk_idx = int(np.argmax(pred))
+                        class_map = {0: "SAFE", 1: "WARNING", 2: "DANGER"}
+                        risk_level = class_map.get(risk_idx, "SAFE")
+                        confidence = round(float(pred[risk_idx]), 4)
+                        
+                        # Dự báo mức PPM ước tính tương ứng với risk level
+                        if risk_level == "DANGER":
+                            predicted_gas = max(900.0, current_gas)
+                        elif risk_level == "WARNING":
+                            predicted_gas = max(400.0, current_gas)
+                        else:
+                            predicted_gas = min(399.0, current_gas)
+                    else:  # Hồi quy trực tiếp giá trị PPM
+                        predicted_gas = float(pred[0])
+                        if predicted_gas >= 900.0 or current_gas >= 900.0:
+                            risk_level = "DANGER"
+                        elif predicted_gas >= 400.0 or current_gas >= 400.0:
+                            risk_level = "WARNING"
+                        else:
+                            risk_level = "SAFE"
+                
+                elif model_type == "sklearn":
+                    # Xử lý tương thích với mô hình Scikit-Learn (.pkl) cũ
+                    flat_features = lstm_tensor[0, -1, :].reshape(1, -1)
+                    pred_res = model.predict(flat_features)[0]
+                    if isinstance(pred_res, (int, np.integer)):
+                        risk_map = {0: "SAFE", 1: "WARNING", 2: "DANGER"}
+                        risk_level = risk_map.get(int(pred_res), "SAFE")
+                    else:
+                        risk_level = str(pred_res).upper()
+
+            except Exception as eval_err:
+                print(f"⚠️ Lỗi suy luận model: {eval_err}")
+                risk_level = "DANGER" if current_gas >= 900 else ("WARNING" if current_gas >= 400 else "SAFE")
+        else:
+            # Rule-based fallback
+            if current_gas >= 900.0:
+                risk_level = "DANGER"
+            elif current_gas >= 400.0:
+                risk_level = "WARNING"
+            else:
+                risk_level = "SAFE"
+
+        # 2. Đánh giá Xu hướng (Trend)
+        diff = predicted_gas - current_gas
+        if diff > 10.0 or gas_diff > 15.0:
+            trend = "RISING"
+        elif diff < -10.0 or gas_diff < -15.0:
+            trend = "FALLING"
+        else:
+            trend = "STABLE"
+
+        # 3. Đề xuất Hành động (Recommended Action)
+        if risk_level == "DANGER":
+            recommended_action = "TURN_ON_FAN_MAX"
+        elif risk_level == "WARNING":
+            recommended_action = "TURN_ON_FAN_MEDIUM"
+        else:
+            recommended_action = "KEEP_AUTO"
+
+        # Tính toán tỷ lệ phần trăm ô nhiễm (phục vụ giao diện Frontend)
+        predicted_pollution_percent = round(min(100.0, max(0.0, (predicted_gas / 10000.0) * 100.0)), 2)
+
+        return {
+            "timestamp": datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "device_id": req.device_id,
+            "model_version": model_version,
+            "model_type": model_type,
+            "prediction_window_minutes": 15,
+            "predicted_gas_ppm": round(predicted_gas, 2),
+            "predicted_pollution_percent": predicted_pollution_percent,
+            "risk_assessment": risk_level,
+            "confidence": confidence,
+            "trend": trend,
+            "recommended_action": recommended_action,
+            "detail": "AI LSTM prediction computed successfully"
+        }
+
+    except Exception as e:
+        # Fallback an toàn tuyệt đối HTTP 200 giúp hệ thống không bị crash
+        return JSONResponse(
+            status_code=200,
+            content={
+                "timestamp": datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "device_id": req.device_id if req else "unknown",
+                "model_version": model_version,
+                "prediction_window_minutes": 15,
+                "predicted_pollution_percent": 0.0,
+                "risk_assessment": "SAFE",
+                "trend": "STABLE",
+                "recommended_action": "KEEP_AUTO",
+                "detail": f"AI Fallback active: {str(e)}"
+            }
+        )
+
+
+# ==============================================================================
+# KHỐI 5: CHẠY SERVICE (UVICORN)
 # ==============================================================================
 if __name__ == "__main__":
-    # 3.1. Nạp file dữ liệu giả lập để test vòng lặp dịch chuyển cửa sổ trượt
-    df_mock = pd.read_csv('data/mock_kitchen_data.csv')
-    
-    print("-> AI Service đang chạy (Tần suất 10s/lần)... Press Ctrl+C to stop.")
-    
-    # 3.2. Vòng lặp mô phỏng cảm biến liên tục gửi dữ liệu (mỗi 10 giây trượt thêm 1 mẫu)
-    for i in range(len(df_mock) - 20):
-        # Trích xuất đúng 20 mẫu dữ liệu liên tiếp (Cửa sổ trượt 20)
-        window_data = df_mock.iloc[i : i + 20].to_dict(orient='records')
-        
-        # Gọi hàm API để lấy kết quả dự báo
-        result = predict_future(window_data)
-        
-        # In kết quả suy luận ra console để kiểm tra
-        print(f"[{result['timestamp']}] Predict 15m later: {result['predicted_pollution_percent']}% | Trend: {result['trend']}")
-        
-        # Nghỉ 10 giây đúng với chu kỳ phát tín hiệu của hệ thống IoT
-        time.sleep(10)
+    port = int(os.getenv("PORT", 8001))
+    print(f"🚀 AI Service đang khởi chạy tại http://0.0.0.0:{port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)

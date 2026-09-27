@@ -62,7 +62,10 @@ async def require_write_access(request: Request,
         return
 
     ip = _client_ip(request)
-    blocked = _too_many_fails(ip)
+    if _too_many_fails(ip):
+        # Đang bị chặn thì không ghi thêm AUTH_FAILED: dò khoá liên tục sẽ làm phình bảng system_events
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
+                            "Sai khoá quá nhiều lần, thử lại sau 1 phút")
     log.warning("Từ chối lệnh ghi %s từ %s (%s)", request.url.path, ip,
                 "thiếu X-API-Key" if not key else "khoá sai")
     await request.app.state.db.log_event(
@@ -70,8 +73,4 @@ async def require_write_access(request: Request,
         f"Từ chối {request.method} {request.url.path} từ {ip}: "
         + ("thiếu X-API-Key" if not key else "khoá sai"),
         "WARNING", "api", {"ip": ip, "path": request.url.path})
-
-    if blocked:
-        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
-                            "Sai khoá quá nhiều lần, thử lại sau 1 phút")
     raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Thiếu hoặc sai header X-API-Key")

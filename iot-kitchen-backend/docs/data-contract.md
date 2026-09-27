@@ -181,8 +181,10 @@ ESP32 chỉ thực hiện khi đang ở `MANUAL`. Đang ở `AUTO` thì bỏ qua
 {"ppm_mid_threshold": 800, "ppm_bad_threshold": 1000, "temp_threshold": 33, "dwell_time_seconds": 30}
 ```
 
-Đơn vị: **ppm**, độ C, **giây**. Bản tin chỉ chứa những trường vừa được thay đổi, các trường còn lại
-firmware giữ nguyên giá trị cũ. Trường `pollution_threshold` theo phần trăm của v1.1 không còn được
+Đơn vị: **ppm**, độ C, **giây**. Backend luôn gửi **đủ 4 trường** lấy từ bảng `device_config`, vì
+broker chỉ giữ bản retain cuối cùng: gửi thiếu thì lần ESP32 khởi động lại sau chỉ nhận lại đúng các
+trường có trong bản tin cuối. Firmware vẫn nên chấp nhận bản tin thiếu trường (trường nào không có thì
+giữ nguyên giá trị cũ). Trường `pollution_threshold` theo phần trăm của v1.1 không còn được
 gửi xuống thiết bị, vì FSM v1.2 chạy theo hai mốc ppm. Web có thể chỉ gửi một trường; các trường không xuất hiện thì
 giữ nguyên giá trị cũ, đừng đặt về mặc định. Nhận xong thì phát lại `config/state`.
 
@@ -216,7 +218,7 @@ Dashboard **không publish** lệnh điều khiển. Mọi thao tác đi qua `PO
 không có quyền ghi vì mật khẩu của nó nằm lộ trong mã JavaScript.
 
 Gợi ý cho biểu đồ: dùng `GET /history?bucket_seconds=N` — 1 giờ dùng 30, 6 giờ dùng 180, 24 giờ
-dùng 60. Server gộp sẵn nên trình duyệt không phải vẽ 43.200 điểm.
+dùng 60. Có `bucket_seconds` thì mặc định trả đủ mọi khung, không cần truyền `limit`. Server gộp sẵn nên trình duyệt không phải vẽ 43.200 điểm.
 
 Các trường mới mà Dashboard nên hiển thị: `config_in_sync` (cảnh báo khi ngưỡng lệch),
 `device_config` (ngưỡng thiết bị đang dùng), và `seq` trong `latest`.

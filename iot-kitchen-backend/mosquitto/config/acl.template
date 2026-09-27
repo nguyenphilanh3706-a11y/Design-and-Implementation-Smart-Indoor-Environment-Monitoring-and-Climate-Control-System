@@ -21,7 +21,7 @@ topic read $SYS/#
 #   điều khiển quạt hay ghi đè dữ liệu của thiết bị khác.
 # ---------------------------------------------------------------------
 user esp32_device
-topic write iot/kitchen/__DEVICE_ID__/telemetry
+topic readwrite iot/kitchen/__DEVICE_ID__/telemetry
 topic write iot/kitchen/__DEVICE_ID__/status
 topic write iot/kitchen/__DEVICE_ID__/actuator/state
 topic write iot/kitchen/__DEVICE_ID__/config/state

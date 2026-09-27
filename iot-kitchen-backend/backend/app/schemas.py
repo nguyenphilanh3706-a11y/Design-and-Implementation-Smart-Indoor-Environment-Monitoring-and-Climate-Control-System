@@ -1,4 +1,5 @@
 """Mô hình dữ liệu (Pydantic): payload MQTT theo Bản thống nhất + request/response của REST API."""
+import math
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
@@ -16,6 +17,23 @@ def to_iso_utc(value: datetime) -> str:
 
 
 UtcDateTime = Annotated[datetime, PlainSerializer(to_iso_utc, return_type=str, when_used="json")]
+
+
+def _round_json(digits: int | None) -> PlainSerializer:
+    """Làm tròn số khi API trả JSON. CSDL vẫn giữ nguyên số gốc cho AI của TV5 và cho /diagnostics.
+    AHT20 chỉ chính xác khoảng ±0,3 °C / ±2 %RH và ppm của MQ-135 là ước lượng, nên chữ số lẻ thứ hai
+    trở đi là nhiễu. digits=None: làm tròn thành số nguyên."""
+    def _round(value: float) -> float | int | None:
+        if not math.isfinite(value):          # NaN/inf không phải JSON hợp lệ
+            return None
+        return round(value) if digits is None else round(value, digits)
+    return PlainSerializer(_round, return_type=(int if digits is None else float) | None,
+                           when_used="json-unless-none")
+
+
+Round1 = Annotated[float, _round_json(1)]      # °C, %RH, % ô nhiễm: 31.25839 -> 31.3
+Round3 = Annotated[float, _round_json(3)]      # Rs/R0: 2.91347 -> 2.913
+RoundInt = Annotated[float, _round_json(None)]  # ppm: 225.641 -> 226
 
 
 # =====================================================================
@@ -177,11 +195,11 @@ class TelemetryOut(BaseModel):
     timestamp: UtcDateTime
     received_at: UtcDateTime | None = None
     seq: int | None = None
-    temperature: float | None = None
-    humidity: float | None = None
-    pollution_percent: float | None = None
-    rs_ro_ratio: float | None = None
-    gas_ppm: float | None = None
+    temperature: Round1 | None = None
+    humidity: Round1 | None = None
+    pollution_percent: Round1 | None = None
+    rs_ro_ratio: Round3 | None = None
+    gas_ppm: RoundInt | None = None
     fan_state: int | None = None
     fan_speed_percent: int | None = None
     mode: str | None = None
@@ -199,7 +217,7 @@ class StatusResponse(BaseModel):
         description="FRESH < 3000 ms ≤ DELAYED ≤ 10000 ms < STALE")
     fan_state: int | None
     mode: str | None
-    gas_ppm: float | None = Field(None, description="Nồng độ khí mới nhất (ppm)")
+    gas_ppm: RoundInt | None = Field(None, description="Nồng độ khí mới nhất (ppm)")
     air_quality: Literal["GOOD", "MID", "BAD"] | None = Field(
         None, description="< 800 GOOD · 800-1000 MID · > 1000 BAD (mốc đổi được qua /config)")
     fan_speed_percent: int | None = Field(None, description="0 / 50 / 100")
@@ -304,8 +322,8 @@ class PredictionOut(BaseModel):
     timestamp: UtcDateTime = Field(description="Thời điểm suy luận")
     target_time: UtcDateTime = Field(description="Thời điểm được dự báo = timestamp + 15 phút")
     prediction_window_minutes: int
-    predicted_pollution_percent: float
-    current_pollution_percent: float | None
+    predicted_pollution_percent: Round1
+    current_pollution_percent: Round1 | None
     trend: Literal["RISING", "FALLING", "STABLE"]
     model_version: str | None
     inference_ms: float | None

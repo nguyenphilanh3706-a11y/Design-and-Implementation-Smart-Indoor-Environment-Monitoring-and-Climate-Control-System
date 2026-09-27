@@ -139,7 +139,9 @@ async def get_history(
     start: Annotated[datetime | None, Query(description="ISO 8601, mặc định = end - 1 giờ",
                                             examples=["2026-09-12T00:00:00Z"])] = None,
     end: Annotated[datetime | None, Query(description="ISO 8601, mặc định = bây giờ")] = None,
-    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT, description="Số bản ghi tối đa")] = 100,
+    limit: Annotated[int | None, Query(ge=1, le=MAX_LIMIT,
+                                       description="Số bản ghi tối đa. Bỏ trống: 100 bản ghi thô, hoặc "
+                                                   "đủ mọi khung khi có bucket_seconds")] = None,
     offset: Annotated[int, Query(ge=0, description="Bỏ qua bao nhiêu bản ghi (phân trang)")] = 0,
     order: Annotated[Literal["asc", "desc"], Query(description="asc: cũ→mới (vẽ biểu đồ)")] = "asc",
     bucket_seconds: Annotated[int | None, Query(ge=1, le=86_400,
@@ -149,6 +151,10 @@ async def get_history(
     """Cảm biến gửi 2 s/lần, tức 1800 điểm/giờ. Vẽ thẳng 24 h (43.200 điểm) sẽ làm treo trình duyệt,
     nên với khoảng thời gian dài hãy dùng `bucket_seconds` để server gộp sẵn."""
     device = resolve_device(settings, device_id)
+    # Có gộp khung thì mặc định trả ĐỦ mọi khung: 1 giờ gộp 30 s đã là 120-121 khung, mà trước đây
+    # limit mặc định 100 + order asc làm mất đúng 10 phút MỚI NHẤT của biểu đồ.
+    if limit is None:
+        limit = MAX_LIMIT if bucket_seconds else 100
     end = end or datetime.now(timezone.utc)
     start = start or end - timedelta(hours=1)
     if start.tzinfo is None:
@@ -265,7 +271,11 @@ async def post_config(body: ConfigUpdate, db: DbDep, mqtt: MqttDep, alerts: Aler
     config = DeviceConfig.model_validate(dict(row))
     alerts.set_thresholds(device, dict(row))   # áp dụng ngay cho bản tin telemetry kế tiếp
 
-    device_payload = {k: fields[k] for k in DEVICE_FIELDS if k in fields}
+    # Broker chỉ giữ BẢN TIN RETAIN CUỐI CÙNG, bản mới thay hẳn bản cũ. Nếu chỉ gửi trường vừa đổi thì
+    # lần sau ESP32 khởi động lại chỉ nhận lại đúng trường đó, các trường khác về giá trị nạp cứng
+    # trong firmware (-> CONFIG_MISMATCH). Vì vậy hễ có tham số FSM thay đổi là gửi đủ 4 trường từ CSDL.
+    device_changed = any(k in fields for k in DEVICE_FIELDS)
+    device_payload = {k: row[k] for k in DEVICE_FIELDS} if device_changed else {}
     topic_name = topic(device, "config/set") if device_payload else None
     if device_payload:
         await _publish_or_503(mqtt, topic_name, device_payload, qos=1, retain=True)

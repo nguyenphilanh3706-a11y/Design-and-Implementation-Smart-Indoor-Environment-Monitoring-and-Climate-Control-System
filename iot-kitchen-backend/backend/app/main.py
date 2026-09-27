@@ -128,6 +128,8 @@ async def health() -> HealthResponse:
     try:
         await app.state.db.ping()
         database = "connected"
+        if app.state.mqtt.last_insert_error:           # DB còn sống nhưng ghi telemetry đang lỗi
+            database = f"insert_failing: {app.state.mqtt.last_insert_error[:200]}"
     except Exception as exc:
         database = f"error: {type(exc).__name__}"
 

@@ -25,6 +25,7 @@ from .schemas import ActuatorStateIn, ConfigStateIn, StatusIn, TelemetryIn, sani
 log = logging.getLogger("mqtt")
 
 MAX_PAST_SKEW = timedelta(hours=24)    # gửi bù sau khi mất mạng -> vẫn nhận
+PAST_SKEW_WARN = timedelta(minutes=5)   # chậm hơn mức này thì vẫn nhận nhưng ghi CLOCK_SKEW để còn biết
 MAX_FUTURE_SKEW = timedelta(seconds=60)  # đồng hồ thiết bị chạy nhanh -> không nhận (xem _sample_time)
 # Chỉ đối chiếu các tham số FSM ppm đang dùng. pollution_threshold (%) của v1.1 đã bỏ khỏi FSM,
 # nếu vẫn bắt buộc thì firmware mới không báo trường đó sẽ bị coi là lệch ngưỡng mãi.
@@ -51,6 +52,7 @@ class MqttService:
         self._last_faults: dict[str, list[str]] = {}          # để không ghi lại sự kiện y hệt mỗi 2 giây
         self._task: asyncio.Task | None = None
         self._last_skew_warning = 0.0
+        self.last_insert_error: str | None = None             # /health dùng để báo "insert_failing"
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="mqtt-loop")
@@ -142,7 +144,20 @@ class MqttService:
         try:
             await self.db.insert_telemetry(device_id, sample_time, received_at, t)
         except Exception as exc:
-            log.error("Không ghi được telemetry vào DB: %s", exc)
+            # Trước đây chỉ ghi log: /health vẫn "ok" và Dashboard (đọc MQTT trực tiếp) vẫn chạy,
+            # nên CSDL ngừng nhận dữ liệu (VD chưa chạy migration) mà không ai biết.
+            error = f"{type(exc).__name__}: {exc}"
+            if error != self.last_insert_error:          # chỉ ghi khi lỗi mới xuất hiện, không ghi mỗi 2 giây
+                log.error("Không ghi được telemetry vào DB: %s", error)
+                await self.db.log_event(device_id, "DB_WRITE_FAILED",
+                                        f"Không ghi được telemetry vào CSDL: {error}", "CRITICAL", "backend")
+            self.last_insert_error = error
+        else:
+            if self.last_insert_error:
+                log.info("Ghi telemetry vào DB đã hoạt động trở lại")
+                await self.db.log_event(device_id, "DB_WRITE_RECOVERED",
+                                        "Ghi telemetry vào CSDL đã hoạt động trở lại", "INFO", "backend")
+                self.last_insert_error = None
 
         if t.mode:
             self.latest_mode[device_id] = t.mode
@@ -198,15 +213,23 @@ class MqttService:
             await self._log_clock_skew(device_id, timestamp, lech,
                                        "đồng hồ thiết bị chạy CHẬM hơn server quá 24 giờ")
             return received_at
+        if -lech > PAST_SKEW_WARN:
+            # Vẫn lưu theo giờ thiết bị (có thể là dữ liệu gửi bù), nhưng nếu là bản tin trực tiếp thì
+            # /status báo STALE, /history 1 giờ gần nhất không thấy dữ liệu và AI thiếu cửa sổ.
+            await self._log_clock_skew(device_id, timestamp, lech, "đồng hồ thiết bị chạy CHẬM hơn server",
+                                       dung_gio_server=False)
         return timestamp
 
-    async def _log_clock_skew(self, device_id: str, timestamp: datetime, lech: timedelta, ly_do: str) -> None:
+    async def _log_clock_skew(self, device_id: str, timestamp: datetime, lech: timedelta, ly_do: str,
+                              dung_gio_server: bool = True) -> None:
         """Ghi cảnh báo tối đa 1 lần/phút để không làm ngập log và bảng sự kiện."""
         if time.monotonic() - self._last_skew_warning < 60:
             return
         self._last_skew_warning = time.monotonic()
         giay = round(lech.total_seconds(), 1)
-        message = (f"{ly_do} {abs(giay):.0f} giây -> tạm dùng giờ server để lưu. "
+        hanh_dong = ("tạm dùng giờ server để lưu" if dung_gio_server
+                     else "vẫn lưu theo giờ thiết bị (nếu không phải dữ liệu gửi bù thì Dashboard sẽ báo STALE)")
+        message = (f"{ly_do} {abs(giay):.0f} giây -> {hanh_dong}. "
                    f"Thiết bị cần đồng bộ NTP trước khi gửi telemetry.")
         log.warning("%s (timestamp nhận được: %s)", message, timestamp.isoformat())
         await self.db.log_event(device_id, "CLOCK_SKEW", message, "WARNING", "esp32",
