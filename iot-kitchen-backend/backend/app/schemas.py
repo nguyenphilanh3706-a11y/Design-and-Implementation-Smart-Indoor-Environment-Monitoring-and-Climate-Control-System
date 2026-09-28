@@ -329,14 +329,32 @@ class PredictionOut(BaseModel):
     inference_ms: float | None
 
 
+class ForecastOut(BaseModel):
+    """Một dự báo của mô hình LSTM (bảng ai_forecasts): lớp rủi ro sau horizon_minutes phút."""
+    timestamp: UtcDateTime = Field(description="Lúc dự báo")
+    target_time: UtcDateTime = Field(description="Thời điểm được dự báo (timestamp + horizon_minutes)")
+    horizon_minutes: int
+    hazard_level: int | None = Field(None, description="0 = SAFE, 1 = WARNING, 2 = DANGER")
+    status: str
+    confidence: float | None = Field(None, description="Xác suất của lớp được chọn")
+    prob_safe: float | None = None
+    prob_warning: float | None = None
+    prob_danger: float | None = None
+    current_gas_ppm: RoundInt | None = Field(None, description="Nồng độ khí lúc dự báo (ppm)")
+    temperature: Round1 | None = None
+    humidity: Round1 | None = None
+    model_version: str | None = None
+    inference_ms: float | None = None
+
+
 class PredictionStatus(BaseModel):
     enabled: bool
-    available: bool = Field(description="Có dự báo dùng được tại thời điểm này không")
+    available: bool = Field(description="Có dự báo mới và AI đang chạy bình thường (không có detail) hay không")
     model_version: str | None
     window_size: int | None
     sample_seconds: int | None
     detail: str | None = Field(description="Lý do chưa dự báo được, nếu có")
-    latest: PredictionOut | None
+    latest: ForecastOut | None = Field(description="Dự báo gần nhất đã lưu, kể cả khi đã cũ")
 
 
 class PredictionAccuracy(BaseModel):

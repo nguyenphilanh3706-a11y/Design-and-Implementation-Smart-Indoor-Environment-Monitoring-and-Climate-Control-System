@@ -1,5 +1,7 @@
 # TÍCH HỢP MÔ HÌNH AI - Nhiệm vụ Tuần 2 của TV3
 
+> **Cập nhật 28/9 - mô hình LSTM (`ai/models/kitchen_lstm_15m.h5`).** Mỗi dự báo (lớp SAFE / WARNING / DANGER sau 15 phút) được lưu vào bảng `ai_forecasts` (migration `2026-09-28_add_ai_forecasts.sql`) và trả qua `GET /prediction`, `GET /prediction/history`. Sự kiện `AI_FORECAST` chỉ được ghi khi lớp dự báo thay đổi. Backend bỏ qua lượt dự báo khi mẫu telemetry mới nhất về backend quá 15 giây trước, để mô hình không dự báo lặp lại trên dữ liệu cũ. `GET /prediction/accuracy` vẫn là của mô hình hồi quy cũ.
+
 Gửi TV5 và dùng cho Chương 4 báo cáo. Mô hình Random Forest của TV5 đã chạy trong hệ thống thật:
 Backend lấy dữ liệu từ TimescaleDB, gọi dịch vụ AI suy luận, publish kết quả lên MQTT và lưu lại
 để đo độ chính xác.

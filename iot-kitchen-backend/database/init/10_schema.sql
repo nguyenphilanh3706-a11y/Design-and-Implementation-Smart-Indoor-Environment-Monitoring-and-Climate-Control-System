@@ -107,3 +107,27 @@ SELECT create_hypertable('ai_predictions', by_range('time', INTERVAL '7 days'), 
 CREATE INDEX IF NOT EXISTS idx_pred_device_time ON ai_predictions (device_id, time DESC);
 CREATE INDEX IF NOT EXISTS idx_pred_target ON ai_predictions (device_id, target_time);
 SELECT add_retention_policy('ai_predictions', INTERVAL '90 days', if_not_exists => TRUE);
+
+-- ---------------------------------------------------------------------
+-- Dự báo của mô hình LSTM (lớp rủi ro sau 15 phút)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ai_forecasts (
+    time             TIMESTAMPTZ      NOT NULL,          -- lúc dự báo
+    target_time      TIMESTAMPTZ      NOT NULL,          -- thời điểm được dự báo (time + 15 phút)
+    device_id        TEXT             NOT NULL,
+    horizon_minutes  SMALLINT         NOT NULL,
+    hazard_level     SMALLINT,                           -- 0 SAFE, 1 WARNING, 2 DANGER
+    status           TEXT             NOT NULL,
+    confidence       DOUBLE PRECISION,                   -- xác suất của lớp được chọn
+    prob_safe        DOUBLE PRECISION,
+    prob_warning     DOUBLE PRECISION,
+    prob_danger      DOUBLE PRECISION,
+    current_gas_ppm  DOUBLE PRECISION,                   -- số đo lúc dự báo
+    temperature      DOUBLE PRECISION,
+    humidity         DOUBLE PRECISION,
+    model_version    TEXT,
+    inference_ms     DOUBLE PRECISION
+);
+SELECT create_hypertable('ai_forecasts', by_range('time', INTERVAL '7 days'), if_not_exists => TRUE);
+CREATE INDEX IF NOT EXISTS idx_forecast_device_time ON ai_forecasts (device_id, time DESC);
+SELECT add_retention_policy('ai_forecasts', INTERVAL '90 days', if_not_exists => TRUE);

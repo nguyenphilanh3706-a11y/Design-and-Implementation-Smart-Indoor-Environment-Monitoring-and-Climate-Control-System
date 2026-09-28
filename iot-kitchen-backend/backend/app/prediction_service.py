@@ -21,6 +21,9 @@ TIME_STEPS = 30
 MODEL_SAMPLE_SECONDS = 2
 FORECAST_MINUTES = 15
 MAX_GAP_FACTOR = 3.0
+# The newest row of the window must have reached the backend recently. Otherwise the "30 newest"
+# rows are old data and the model keeps forecasting on the same window again and again.
+STALE_WINDOW_SECONDS = 15
 
 EXPECTED_MODEL_TYPE = "keras_lstm"
 EXPECTED_N_FEATURES = 5
@@ -51,6 +54,8 @@ class PredictionService:
 
         self._task: asyncio.Task | None = None
         self._last_logged_skip: str | None = None
+        self._last_event_status: dict[str, str] = {}   # AI_FORECAST is logged only when this changes
+        self._last_store_error: str | None = None
 
     # =========================================================================
     # START / STOP
@@ -272,6 +277,7 @@ class PredictionService:
                 """
                 SELECT
                     time,
+                    received_at,
                     temperature,
                     humidity,
                     gas_ppm
@@ -294,7 +300,17 @@ class PredictionService:
                 f"can khoang {TIME_STEPS * MODEL_SAMPLE_SECONDS}s du lieu"
             )
 
-        # Query is DESC. Reverse to chronological order before sending to the LSTM service.
+        # Query is DESC, so rows[0] is the newest sample by device time. It must have arrived
+        # recently: if not, the device is offline, telemetry is not being stored, or the ESP32
+        # clock runs behind so new rows sort below old ones.
+        age = (datetime.now(timezone.utc) - rows[0]["received_at"]).total_seconds()
+        if age > STALE_WINDOW_SECONDS:
+            return self._skip(
+                f"Du lieu AI da cu: mau moi nhat ve backend cach day {age:.0f}s "
+                "(thiet bi OFFLINE, ghi DB loi, hoac dong ho ESP32 bi lui)"
+            )
+
+        # Reverse to chronological order before sending to the LSTM service.
         rows = list(reversed(rows))
 
         # Do not silently skip a broken sample because that changes the time sequence.
@@ -429,35 +445,39 @@ class PredictionService:
             log.warning("Khong publish duoc ket qua AI: %s", exc)
 
         # ------------------------------------------------------------------
-        # DB event log
+        # Every forecast -> ai_forecasts (read by GET /prediction and /prediction/history)
         # ------------------------------------------------------------------
-        # The existing ai_predictions schema belongs to the former regression model.
-        # Store the new future-risk classification as an event until the DB schema/API
-        # are migrated explicitly for the LSTM contract.
-        status = str(payload.get("status") or "UNKNOWN").upper()
-
-        if status == "DANGER":
-            severity = "CRITICAL"
-        elif status == "WARNING":
-            severity = "WARNING"
-        else:
-            severity = "INFO"
-
         try:
-            await self.db.log_event(
-                device,
-                "AI_FORECAST",
-                (
-                    f"AI +{prediction_window_minutes}m: {status} "
-                    f"(confidence={payload.get('confidence')}, "
-                    f"trend={payload.get('trend')})"
-                ),
-                severity,
-                "ai",
-                payload,
-            )
+            await self.db.insert_forecast(device, now, target_time, prediction_window_minutes, payload)
+            self._last_store_error = None
         except Exception as exc:
-            log.warning("Khong ghi duoc AI_FORECAST vao DB: %s", exc)
+            error = f"{type(exc).__name__}: {exc}"
+            if error != self._last_store_error:          # once per new error, not every 10 s
+                log.error("Khong luu duoc du bao vao ai_forecasts (da chay migration 2026-09-28 chua?): %s", error)
+            self._last_store_error = error
+
+        # ------------------------------------------------------------------
+        # Event log: only when the forecast level changes, so the dashboard's Event Log
+        # is not buried under one AI_FORECAST row every 10 seconds
+        # ------------------------------------------------------------------
+        status = str(payload.get("status") or "UNKNOWN").upper()
+        previous = self._last_event_status.get(device)
+
+        if status != previous:
+            self._last_event_status[device] = status
+            severity = {"DANGER": "CRITICAL", "WARNING": "WARNING"}.get(status, "INFO")
+            change = f"{previous} -> {status}" if previous else status
+            try:
+                await self.db.log_event(
+                    device,
+                    "AI_FORECAST",
+                    f"AI +{prediction_window_minutes}m: {change} (confidence={payload.get('confidence')})",
+                    severity,
+                    "ai",
+                    payload,
+                )
+            except Exception as exc:
+                log.warning("Khong ghi duoc AI_FORECAST vao DB: %s", exc)
 
         log.info(
             "AI +%dm -> %s | confidence=%s | trend=%s | current_gas=%s ppm | %.2f ms",

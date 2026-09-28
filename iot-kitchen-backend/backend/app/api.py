@@ -20,7 +20,7 @@ from .mqtt_service import MqttService, MqttUnavailable
 from .security import require_write_access
 from .schemas import (ActuatorRequest, ActuatorResponse, AlertTestResponse, ConfigResponse, ConfigUpdate,
                       ContractCheck, DeviceConfig, DiagnosticsResponse, EventOut, HistoryResponse, Latency,
-                      ModeRequest, ModeResponse, PacketLoss, PredictionAccuracy, PredictionOut,
+                      ForecastOut, ModeRequest, ModeResponse, PacketLoss, PredictionAccuracy,
                       PredictionStatus, StatusResponse, TelemetryOut)
 
 router = APIRouter()
@@ -367,38 +367,41 @@ async def get_diagnostics(
 
 
 @router.get("/prediction", response_model=PredictionStatus, tags=["Dự báo AI"],
-            summary="Dự báo ô nhiễm 15 phút tới")
+            summary="Dự báo rủi ro 15 phút tới (LSTM)")
 async def get_prediction(db: DbDep, settings: SettingsDep, request: Request,
                          device_id: DeviceQuery = None) -> PredictionStatus:
-    """Kết quả suy luận gần nhất của mô hình Random Forest (TV5).
+    """Dự báo gần nhất của mô hình LSTM (TV5): lớp SAFE / WARNING / DANGER sau 15 phút.
 
-    Dashboard nên dùng MQTT topic `.../ai_prediction` để nhận ngay khi có, endpoint này
-    dùng lúc mới mở trang hoặc khi cần biết vì sao chưa có dự báo (trường `detail`).
+    `available` chỉ bật khi dự báo gần nhất còn mới (trong khoảng 3 chu kỳ AI). Khi AI tạm dừng,
+    ví dụ vì dữ liệu cũ hay thiết bị OFFLINE, `latest` vẫn là dự báo cuối cùng đã lưu và `detail`
+    cho biết lý do. Dashboard nên nhận kết quả mới qua MQTT topic `.../ai_prediction`.
     """
     device = resolve_device(settings, device_id)
-    ai = request.app.state.prediction
-    row = await db.latest_prediction(device)
-    info = ai.status()
+    info = request.app.state.prediction.status()
+    row = await db.latest_forecast(device)
+    detail = info["last_error"] or info["last_skip_reason"]
+    fresh_s = max(3 * settings.ai_interval_s, 30)
+    fresh = row is not None and (datetime.now(timezone.utc) - row["time"]).total_seconds() <= fresh_s
     return PredictionStatus(
-        enabled=info["enabled"], available=row is not None, model_version=info["model_version"],
+        enabled=info["enabled"], available=fresh and detail is None, model_version=info["model_version"],
         window_size=info["window_size"], sample_seconds=info["sample_seconds"],
-        detail=info["last_error"] or info["last_skip_reason"],
-        latest=PredictionOut.model_validate(dict(row) | {"timestamp": row["time"]}) if row else None,
+        detail=detail,
+        latest=ForecastOut.model_validate(dict(row) | {"timestamp": row["time"]}) if row else None,
     )
 
 
-@router.get("/prediction/history", response_model=list[PredictionOut], tags=["Dự báo AI"],
-            summary="Các lần dự báo gần đây")
+@router.get("/prediction/history", response_model=list[ForecastOut], tags=["Dự báo AI"],
+            summary="Các lần dự báo gần đây (LSTM)")
 async def get_prediction_history(db: DbDep, settings: SettingsDep, device_id: DeviceQuery = None,
                                  minutes: Annotated[int, Query(ge=1, le=1440)] = 60,
-                                 limit: Annotated[int, Query(ge=1, le=1000)] = 100) -> list[PredictionOut]:
-    """Dùng để vẽ đường dự báo chồng lên đường thực đo trên cùng một biểu đồ."""
-    rows = await db.prediction_history(resolve_device(settings, device_id), minutes, limit)
-    return [PredictionOut.model_validate(dict(r) | {"timestamp": r["time"]}) for r in rows]
+                                 limit: Annotated[int, Query(ge=1, le=1000)] = 100) -> list[ForecastOut]:
+    """Mới nhất đứng đầu. Dùng để vẽ dải màu rủi ro dự báo cạnh biểu đồ số đo."""
+    rows = await db.forecast_history(resolve_device(settings, device_id), minutes, limit)
+    return [ForecastOut.model_validate(dict(r) | {"timestamp": r["time"]}) for r in rows]
 
 
 @router.get("/prediction/accuracy", response_model=PredictionAccuracy, tags=["Dự báo AI"],
-            summary="Đo độ chính xác của mô hình trên dữ liệu thật")
+            summary="(Mô hình hồi quy cũ) Đo độ chính xác trên dữ liệu thật")
 async def get_prediction_accuracy(db: DbDep, settings: SettingsDep, device_id: DeviceQuery = None,
                                   hours: Annotated[int, Query(ge=1, le=720)] = 24) -> PredictionAccuracy:
     """Đối chiếu từng dự báo với giá trị **thực đo** tại đúng thời điểm đã dự báo.

@@ -227,6 +227,38 @@ class Database:
             result["trend"], result.get("model_version"), result.get("inference_ms"),
         )
 
+    # ---------- LSTM forecasts (risk class 15 minutes ahead) ----------
+    async def insert_forecast(self, device_id: str, made_at: datetime, target_time: datetime,
+                              horizon_minutes: int, p: Mapping[str, Any]) -> None:
+        probs = p.get("probabilities") or {}
+        await self.pool.execute(
+            """
+            INSERT INTO ai_forecasts (time, target_time, device_id, horizon_minutes, hazard_level,
+                                      status, confidence, prob_safe, prob_warning, prob_danger,
+                                      current_gas_ppm, temperature, humidity, model_version,
+                                      inference_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            """,
+            made_at, target_time, device_id, horizon_minutes, p.get("hazard_level"),
+            str(p.get("status") or "UNKNOWN").upper(), p.get("confidence"),
+            probs.get("SAFE"), probs.get("WARNING"), probs.get("DANGER"),
+            p.get("current_gas_ppm"), p.get("temperature"), p.get("humidity"),
+            p.get("model_version"), p.get("inference_ms"),
+        )
+
+    async def latest_forecast(self, device_id: str) -> Any | None:
+        return await self.pool.fetchrow(
+            "SELECT * FROM ai_forecasts WHERE device_id = $1 ORDER BY time DESC LIMIT 1", device_id)
+
+    async def forecast_history(self, device_id: str, minutes: int, limit: int) -> list[Any]:
+        rows = await self.pool.fetch(
+            """
+            SELECT * FROM ai_forecasts
+            WHERE device_id = $1 AND time > now() - make_interval(mins => $2::int)
+            ORDER BY time DESC LIMIT $3
+            """, device_id, minutes, limit)
+        return list(rows)
+
     async def latest_prediction(self, device_id: str) -> Any | None:
         return await self.pool.fetchrow(
             "SELECT * FROM ai_predictions WHERE device_id = $1 ORDER BY time DESC LIMIT 1", device_id)
