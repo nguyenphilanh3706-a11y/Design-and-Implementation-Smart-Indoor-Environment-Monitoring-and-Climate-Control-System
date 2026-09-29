@@ -1,4 +1,3 @@
-<<<<<<< HEAD:README.md
 # Smart Indoor Environment Monitoring and Climate Control System
 
 ## 📌 Overview
