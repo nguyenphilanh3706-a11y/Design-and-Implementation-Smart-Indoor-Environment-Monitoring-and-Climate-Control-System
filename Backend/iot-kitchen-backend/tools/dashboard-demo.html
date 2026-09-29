@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<!--
+  TRANG DEMO KẾT NỐI BACKEND  -  mở trực tiếp bằng trình duyệt, không cần cài gì
+  Mục đích:
+    1. Tuấn (TV3) kiểm chứng backend phục vụ được trình duyệt thật.
+    2. TV4 chép phần JavaScript bên dưới vào dự án React/Vue của mình.
+  Cách chạy: bấm đúp vào file này, hoặc kéo thả vào Chrome.
+-->
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>Kitchen Backend - Trang kiểm chứng kết nối</title>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<style>
+  body { font-family: system-ui, "Segoe UI", sans-serif; background:#0f172a; color:#e2e8f0;
+         margin:0; padding:24px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:#94a3b8; font-size:13px; margin-bottom:20px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
+  .card { background:#1e293b; border-radius:10px; padding:14px 18px; min-width:150px; }
+  .label { color:#94a3b8; font-size:12px; }
+  .value { font-size:26px; font-weight:600; margin-top:4px; }
+  .badge { border-radius:999px; padding:6px 14px; font-size:13px; font-weight:600; }
+  .green{background:#064e3b;color:#6ee7b7} .yellow{background:#713f12;color:#fde047}
+  .red{background:#7f1d1d;color:#fca5a5} .grey{background:#334155;color:#94a3b8}
+  button { background:#0891b2; color:#fff; border:0; border-radius:8px; padding:9px 16px;
+           font-size:14px; cursor:pointer; margin-right:8px; }
+  button:hover { background:#0e7490; }
+  pre { background:#020617; border-radius:8px; padding:12px; font-size:12px; max-height:180px;
+        overflow:auto; color:#a5b4fc; }
+</style>
+</head>
+<body>
+
+<h1>Kitchen Backend - Trang kiểm chứng kết nối</h1>
+<div class="sub">Thiết bị: <b id="device">esp32_kitchen_01</b> ·
+  Chỉnh thông số kết nối ở đầu phần script trong file này nếu cần.</div>
+
+<div class="row">
+  <span class="badge grey" id="wsBadge">WebSocket: đang nối...</span>
+  <span class="badge grey" id="devBadge">Thiết bị: chưa rõ</span>
+  <span class="badge grey" id="freshBadge">Chưa có dữ liệu</span>
+  <span class="badge grey" id="syncBadge">Ngưỡng: chưa rõ</span>
+</div>
+
+<div class="row">
+  <div class="card"><div class="label">Nhiệt độ</div><div class="value" id="temp">--</div></div>
+  <div class="card"><div class="label">Độ ẩm</div><div class="value" id="hum">--</div></div>
+  <div class="card"><div class="label">Ô nhiễm (MQ-135)</div><div class="value" id="pol">--</div>
+    <div class="label" id="rsro">Rs/R0: --</div></div>
+  <div class="card"><div class="label">Quạt</div><div class="value" id="fan">--</div>
+    <div class="label" id="reason">lý do: --</div></div>
+  <div class="card"><div class="label">Chế độ</div><div class="value" id="mode">--</div></div>
+</div>
+
+<div class="row">
+  <button onclick="setMode('AUTO')">AUTO</button>
+  <button onclick="setMode('MANUAL')">MANUAL</button>
+  <button onclick="setFan(1)">BẬT QUẠT</button>
+  <button onclick="setFan(0)">TẮT QUẠT</button>
+  <button onclick="loadHistory()">Tải lại lịch sử 1 giờ</button>
+</div>
+
+<svg id="chart" width="100%" height="150" style="background:#1e293b;border-radius:10px"></svg>
+<pre id="log">Nhật ký...</pre>
+
+<script>
+// =====================================================================
+//  1. THÔNG SỐ KẾT NỐI  - TV4 đổi sang biến môi trường của Vite khi tích hợp
+// =====================================================================
+const DEVICE   = "esp32_kitchen_01";
+const API      = "http://localhost:8000/api/v1/kitchen";   // REST: lịch sử + điều khiển
+const WS_URL   = "ws://localhost:9001";                     // MQTT over WebSocket: dữ liệu tức thời
+const WS_USER  = "web_dashboard";
+const WS_PASS  = "WebDash2026aA";        // đổi cho khớp MQTT_WEB_PASSWORD trong .env
+const API_KEY  = "";                      // điền khi backend đặt API_KEY trong .env
+const TOPIC    = `iot/kitchen/${DEVICE}`;
+
+const $ = id => document.getElementById(id);
+const log = msg => { $("log").textContent = new Date().toLocaleTimeString() + "  " + msg
+                                            + "\n" + $("log").textContent.slice(0, 1500); };
+let lastTimestamp = null;
+
+// =====================================================================
+//  2. ĐƯỜNG THỨ NHẤT: MQTT over WebSocket - dữ liệu tức thời, 2 giây/lần
+//     Nhờ retain, vừa kết nối là đã có ngay status/mode/config gần nhất.
+// =====================================================================
+const client = mqtt.connect(WS_URL, {
+  username: WS_USER, password: WS_PASS,
+  clean: true, reconnectPeriod: 2000, connectTimeout: 5000,
+});
+
+client.on("connect", () => {
+  badge("wsBadge", "green", "WebSocket: đã nối");
+  client.subscribe(`${TOPIC}/#`);
+  log("Đã nối Broker qua WebSocket, đăng ký " + TOPIC + "/#");
+});
+client.on("reconnect", () => badge("wsBadge", "yellow", "WebSocket: đang nối lại..."));
+client.on("error", err => { badge("wsBadge", "red", "WebSocket: lỗi"); log("Lỗi WS: " + err.message); });
+client.on("close",  () => badge("wsBadge", "red", "WebSocket: mất kết nối"));
+
+client.on("message", (topic, buf) => {
+  let data; try { data = JSON.parse(buf.toString()); } catch { return; }
+  const kind = topic.slice(TOPIC.length + 1);
+
+  if (kind === "telemetry") {
+    lastTimestamp = data.timestamp;
+    $("temp").textContent = fmt(data.temperature, "°C");
+    $("hum").textContent  = fmt(data.humidity, "%");
+    $("pol").textContent  = fmt(data.pollution_percent, "%");
+    $("rsro").textContent = "Rs/R0: " + (data.rs_ro_ratio ?? "--");
+    $("pol").style.color  = pollutionColor(data.pollution_percent);
+    $("fan").textContent  = data.fan_state === 1 ? "ĐANG CHẠY" : "TẮT";
+    $("mode").textContent = data.mode ?? "--";
+  }
+  else if (kind === "status") {
+    const online = data.status === "ONLINE";
+    badge("devBadge", online ? "green" : "red", "Thiết bị: " + data.status);
+    log("Thiết bị chuyển sang " + data.status);
+  }
+  else if (kind === "actuator/state") {
+    $("reason").textContent = "lý do: " + (data.reason ?? "--");
+    if (data.reason === "SAFETY_OVERRIDE") log("CƯỠNG BỨC BẬT QUẠT - ô nhiễm nguy hiểm");
+  }
+});
+
+// =====================================================================
+//  3. ĐỘ TƯƠI DỮ LIỆU - Bản thống nhất mục 5.2
+//     Phải đo bằng đồng hồ chạy liên tục, KHÔNG dựa vào lần nhận bản tin gần nhất:
+//     mất kết nối thì không có bản tin nào về, nếu chỉ cập nhật lúc nhận thì
+//     huy hiệu sẽ đứng im ở màu xanh mãi mãi.
+// =====================================================================
+setInterval(() => {
+  if (!lastTimestamp) { badge("freshBadge", "grey", "Chưa có dữ liệu"); return; }
+  const ms = Date.now() - new Date(lastTimestamp).getTime();
+  if (ms < 3000)       badge("freshBadge", "green",  `Dữ liệu tươi (${ms} ms)`);
+  else if (ms <= 10000) badge("freshBadge", "yellow", `Chậm (${ms} ms)`);
+  else                  badge("freshBadge", "red",    `Mất dữ liệu (${Math.round(ms/1000)} s)`);
+}, 500);
+
+// =====================================================================
+//  4. ĐƯỜNG THỨ HAI: REST API - lịch sử, điều khiển, cấu hình
+//     Điều khiển BẮT BUỘC đi qua REST: tài khoản web_dashboard chỉ có quyền đọc,
+//     và Backend còn phải ghi nhật ký + kiểm tra dữ liệu đầu vào.
+// =====================================================================
+async function setMode(mode) {
+  const r = await post("/mode", { mode });
+  log(`Đổi chế độ: ${r.message ?? JSON.stringify(r)}`);
+}
+
+async function setFan(state) {
+  const r = await post("/actuator", { state });
+  log(`Điều khiển quạt: ${r.message ?? JSON.stringify(r)}` + (r.rtt_ms ? ` (${r.rtt_ms} ms)` : ""));
+  if (r.warning) log("Chú ý: " + r.warning);
+}
+
+async function post(path, body) {
+  try {
+    const res = await fetch(API + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(API_KEY && { "X-API-Key": API_KEY }) },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (res.status === 401) log("Thiếu hoặc sai API_KEY - điền vào biến API_KEY ở đầu file này");
+    else if (res.status === 403) log("Backend đang ở chế độ chỉ đọc (READ_ONLY=true)");
+    else if (!res.ok) log(`Lỗi ${res.status}: ${JSON.stringify(data.detail)}`);
+    return data;
+  } catch (e) { log("Không gọi được API: " + e.message + " (kiểm tra CORS và backend còn chạy không)");
+                return {}; }
+}
+
+async function loadHistory() {
+  // bucket_seconds gộp dữ liệu ngay trên server: 1 giờ = 1800 điểm -> 120 điểm
+  const res  = await fetch(`${API}/history?limit=200&bucket_seconds=30&order=asc`);
+  const data = await res.json();
+  drawChart(data.items.map(i => i.pollution_percent).filter(v => v !== null));
+  log(`Lịch sử: ${data.items.length} điểm (tổng ${data.total} bản ghi trong khoảng)`);
+}
+
+async function loadStatus() {           // gọi 1 lần lúc mở trang để lấy trạng thái đối chiếu ngưỡng
+  const d = await (await fetch(`${API}/status`)).json();
+  const s = d.config_in_sync;
+  badge("syncBadge", s === true ? "green" : s === false ? "red" : "grey",
+        "Ngưỡng: " + (s === true ? "khớp CSDL" : s === false ? "LỆCH với CSDL" : "thiết bị chưa báo"));
+}
+
+// =====================================================================
+//  5. Tiện ích hiển thị
+// =====================================================================
+function badge(id, cls, text) { $(id).className = "badge " + cls; $(id).textContent = text; }
+function fmt(v, unit) { return v === null || v === undefined ? "--" : v.toFixed(1) + " " + unit; }
+function pollutionColor(p) {            // thang màu theo Bản thống nhất mục 2.3
+  if (p === null || p === undefined) return "#e2e8f0";
+  return p >= 50 ? "#f87171" : p >= 40 ? "#fb923c" : p >= 25 ? "#fde047" : "#6ee7b7";
+}
+function drawChart(values) {
+  const svg = $("chart"), w = svg.clientWidth || 800, h = 150;
+  if (!values.length) { svg.innerHTML = ""; return; }
+  const max = Math.max(100, ...values), step = w / Math.max(1, values.length - 1);
+  const pts = values.map((v, i) => `${(i * step).toFixed(1)},${(h - (v / max) * (h - 10)).toFixed(1)}`);
+  svg.innerHTML = `<polyline fill="none" stroke="#22d3ee" stroke-width="2" points="${pts.join(" ")}"/>`;
+}
+
+loadStatus();
+loadHistory();
+setInterval(loadStatus, 10000);
+</script>
+</body>
+</html>

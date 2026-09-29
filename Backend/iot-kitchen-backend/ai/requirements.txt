@@ -1,0 +1,14 @@
+# Ghim đúng phiên bản đã kiểm thử. Nếu TV5 gửi file .pkl train trên máy khác,
+# phải hỏi phiên bản scikit-learn bên đó (pip show scikit-learn) và sửa dòng dưới cho khớp,
+# vì file .pkl của joblib phụ thuộc phiên bản thư viện lúc train.
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+tensorflow>=2.12.0
+scikit-learn==1.9.1
+pandas==3.0.5
+numpy==2.5.3
+joblib==1.6.0
+# tv5/ai_service.py có dòng "import paho.mqtt.client as mqtt" ở đầu file, dù hàm
+# predict_future() không dùng tới. Thiếu gói này thì import module thất bại và
+# dịch vụ báo "No module named 'paho'". Phần MQTT thật do backend lo, không phải ở đây.
+paho-mqtt==2.1.0

@@ -1,0 +1,409 @@
+"""Mô hình dữ liệu (Pydantic): payload MQTT theo Bản thống nhất + request/response của REST API."""
+import math
+from datetime import datetime, timezone
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, model_validator
+
+Mode = Literal["AUTO", "MANUAL"]
+FanState = Literal[0, 1]
+
+
+def to_iso_utc(value: datetime) -> str:
+    """Chuẩn hóa thời gian trả về: ISO 8601 UTC, độ chính xác mili-giây. VD: 2026-09-11T07:30:15.123Z"""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+UtcDateTime = Annotated[datetime, PlainSerializer(to_iso_utc, return_type=str, when_used="json")]
+
+
+def _round_json(digits: int | None) -> PlainSerializer:
+    """Làm tròn số khi API trả JSON. CSDL vẫn giữ nguyên số gốc cho AI của TV5 và cho /diagnostics.
+    AHT20 chỉ chính xác khoảng ±0,3 °C / ±2 %RH và ppm của MQ-135 là ước lượng, nên chữ số lẻ thứ hai
+    trở đi là nhiễu. digits=None: làm tròn thành số nguyên."""
+    def _round(value: float) -> float | int | None:
+        if not math.isfinite(value):          # NaN/inf không phải JSON hợp lệ
+            return None
+        return round(value) if digits is None else round(value, digits)
+    return PlainSerializer(_round, return_type=(int if digits is None else float) | None,
+                           when_used="json-unless-none")
+
+
+Round1 = Annotated[float, _round_json(1)]      # °C, %RH, % ô nhiễm: 31.25839 -> 31.3
+Round3 = Annotated[float, _round_json(3)]      # Rs/R0: 2.91347 -> 2.913
+RoundInt = Annotated[float, _round_json(None)]  # ppm: 225.641 -> 226
+
+
+# =====================================================================
+#  PAYLOAD MQTT NHẬN TỪ ESP32
+# =====================================================================
+class TelemetryIn(BaseModel):
+    """Topic iot/kitchen/{device_id}/telemetry - Bản thống nhất mục 2.2.
+    Giá trị cảm biến cho phép null (khi cảm biến lỗi) để không mất cả bản tin."""
+    model_config = ConfigDict(extra="ignore")
+
+    device_id: str | None = None
+    seq: int | None = Field(None, ge=0, description="Số thứ tự bản tin, tăng 1 mỗi lần gửi")
+    timestamp: datetime | None = None
+    temperature: float | None = Field(None, ge=-40, le=125)
+    humidity: float | None = Field(None, ge=0, le=100)
+    pollution_percent: float | None = Field(None, ge=0, le=100)
+    rs_ro_ratio: float | None = Field(None, ge=0, le=20)
+    gas_ppm: float | None = Field(None, ge=0, le=10000, description="Nồng độ khí MQ-135 quy đổi ra ppm (ESP32 tính)")
+    fan_state: FanState | None = None
+    fan_speed_percent: int | None = Field(None, ge=0, le=100, description="Tốc độ quạt thiết bị báo về")
+    mode: Mode | None = None
+    network_status: str | None = None
+
+
+# ---------------------------------------------------------------------
+#  KIỂM TRA TÍNH HỢP LÝ CỦA SỐ ĐO (sanity check)
+#  Firmware nên gửi null khi cảm biến lỗi, nhưng thực tế nhiều thư viện trả về
+#  giá trị quy ước như -1 / -127 / -999, hoặc NaN. Nếu để nguyên:
+#    * -1 lọt vào avg() làm sai số liệu báo cáo và sai dữ liệu huấn luyện AI của TV5
+#    * ràng buộc ge=0 sẽ làm Pydantic loại BỎ CẢ BẢN TIN, mất luôn các số đo còn tốt
+#  Vì vậy ta đổi riêng trường lỗi thành null rồi mới kiểm tra, và trả về danh sách
+#  trường hỏng để Backend ghi sự kiện SENSOR_FAULT.
+# ---------------------------------------------------------------------
+#  Chỉ dựa vào khoảng giá trị VẬT LÝ, không liệt kê "mã lỗi quy ước": các mã hay gặp
+#  (-1, -99, -127, -999) đều nằm ngoài khoảng nên bị bắt sẵn, trong khi liệt kê thêm
+#  những số như 85 sẽ vô tình xoá mất số đo thật (độ ẩm 85% là hoàn toàn bình thường).
+RANGES: dict[str, tuple[float, float]] = {
+    "temperature": (-40.0, 125.0),
+    "humidity": (0.0, 100.0),
+    "pollution_percent": (0.0, 100.0),
+    "rs_ro_ratio": (0.0, 20.0),
+    "gas_ppm": (0.0, 10000.0),
+}
+
+
+def sanitize_readings(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Trả về (payload đã làm sạch, danh sách trường bị coi là hỏng)."""
+    cleaned, invalid = dict(data), []
+    for field, (low, high) in RANGES.items():
+        value = cleaned.get(field)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            cleaned[field], _ = None, invalid.append(field)
+            continue
+        number = float(value)
+        if number != number or not (low <= number <= high):   # number != number là cách bắt NaN
+            cleaned[field] = None
+            invalid.append(field)
+    return cleaned, invalid
+
+
+class StatusIn(BaseModel):
+    """Topic .../status (LWT). VD: {"device_id": "esp32_kitchen_01", "status": "OFFLINE"}"""
+    device_id: str | None = None
+    status: Literal["ONLINE", "OFFLINE"]
+
+
+class ActuatorStateIn(BaseModel):
+    """Topic .../actuator/state - Bản thống nhất CHƯA quy định payload.
+    Đề xuất với TV2: {"device_id", "fan_state": 0|1, "mode", "reason", "timestamp"}.
+    Chấp nhận cả key "state" để tương thích."""
+    model_config = ConfigDict(extra="ignore")
+
+    device_id: str | None = None
+    fan_state: FanState | None = None
+    state: FanState | None = None
+    mode: Mode | None = None
+    reason: str | None = None          # FSM | MANUAL_COMMAND | SAFETY_OVERRIDE | IGNORED_AUTO_MODE
+    timestamp: datetime | None = None
+
+    @property
+    def value(self) -> int | None:
+        return self.fan_state if self.fan_state is not None else self.state
+
+
+class ConfigStateIn(BaseModel):
+    """Topic .../config/state (retain) - ĐỀ XUẤT MỚI, Bản thống nhất chưa có.
+
+    ESP32 phát lại 3 ngưỡng FSM mà nó ĐANG THỰC SỰ dùng, sau mỗi lần nhận config/set
+    và sau mỗi lần khởi động. Nhờ đó Backend đối chiếu được với bảng device_config:
+    lệnh gửi đi mà thiết bị không áp dụng (sai tên khoá, sai đơn vị, mất gói) sẽ bị
+    phát hiện ngay thay vì đến lúc demo mới biết."""
+    model_config = ConfigDict(extra="ignore")
+
+    device_id: str | None = None
+    temp_threshold: float | None = None
+    dwell_time_seconds: float | None = None
+    ppm_mid_threshold: float | None = None
+    ppm_bad_threshold: float | None = None
+    timestamp: datetime | None = None
+
+    def as_dict(self) -> dict[str, float]:
+        return {k: v for k, v in
+                (("temp_threshold", self.temp_threshold),
+                 ("dwell_time_seconds", self.dwell_time_seconds),
+                 ("ppm_mid_threshold", self.ppm_mid_threshold),
+                 ("ppm_bad_threshold", self.ppm_bad_threshold))
+                if v is not None}
+
+
+# =====================================================================
+#  REST API - REQUEST
+# =====================================================================
+class ActuatorRequest(BaseModel):
+    state: FanState = Field(description="1 = BẬT quạt, 0 = TẮT quạt", examples=[1])
+
+
+class ModeRequest(BaseModel):
+    mode: Mode = Field(description="AUTO: FSM tự điều khiển; MANUAL: điều khiển từ Web", examples=["MANUAL"])
+
+
+class ConfigUpdate(BaseModel):
+    """Chỉ cần gửi các trường muốn đổi.
+
+    ppm_mid_threshold, ppm_bad_threshold, temp_threshold, dwell_time_seconds được đẩy xuống ESP32
+    qua .../config/set. Hai trường alert_* chỉ Backend dùng để quyết định gửi Telegram.
+
+    Từ v1.2 mọi ngưỡng ô nhiễm tính theo ppm. Hai trường cũ theo phần trăm (pollution_threshold,
+    alert_pollution_threshold) đã bỏ: gửi lên sẽ bị bỏ qua vì không còn tác dụng.
+    """
+    model_config = ConfigDict(extra="ignore", json_schema_extra={"examples": [
+        {"ppm_mid_threshold": 800, "ppm_bad_threshold": 1000, "alert_ppm_threshold": 1000}]})
+
+    temp_threshold: float | None = Field(None, ge=0, le=100, description="Ngưỡng nhiệt độ °C gửi xuống FSM")
+    dwell_time_seconds: int | None = Field(None, ge=0, le=600, description="Thời gian khóa trạng thái quạt (giây)")
+    alert_temp_threshold: float | None = Field(None, ge=0, le=100, description="Ngưỡng nhiệt độ °C gửi cảnh báo")
+    ppm_mid_threshold: float | None = Field(None, gt=0, le=10000,
+                                            description="Từ mức này trở lên là MID, quạt 50% (mặc định 800)")
+    ppm_bad_threshold: float | None = Field(None, gt=0, le=10000,
+                                            description="Trên mức này là BAD, quạt 100% (mặc định 1000)")
+    alert_ppm_threshold: float | None = Field(None, gt=0, le=10000,
+                                              description="Trên mức này thì gửi cảnh báo Telegram (mặc định 1000)")
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self):
+        if not self.model_dump(exclude_none=True):
+            raise ValueError("Cần gửi ít nhất 1 tham số cấu hình")
+        if self.ppm_mid_threshold is not None and self.ppm_bad_threshold is not None \
+                and self.ppm_mid_threshold >= self.ppm_bad_threshold:
+            raise ValueError("ppm_mid_threshold phải nhỏ hơn ppm_bad_threshold")
+        return self
+
+
+# =====================================================================
+#  REST API - RESPONSE
+# =====================================================================
+class TelemetryOut(BaseModel):
+    timestamp: UtcDateTime
+    received_at: UtcDateTime | None = None
+    seq: int | None = None
+    temperature: Round1 | None = None
+    humidity: Round1 | None = None
+    pollution_percent: Round1 | None = None
+    rs_ro_ratio: Round3 | None = None
+    gas_ppm: RoundInt | None = None
+    fan_state: int | None = None
+    fan_speed_percent: int | None = None
+    mode: str | None = None
+    network_status: str | None = None
+
+
+class StatusResponse(BaseModel):
+    device_id: str
+    device_status: Literal["ONLINE", "OFFLINE", "UNKNOWN"] = Field(description="Theo bản tin status/LWT gần nhất")
+    device_status_updated_at: UtcDateTime | None
+    mqtt_connected: bool = Field(description="Backend có đang kết nối Broker không")
+    latest: TelemetryOut | None
+    data_freshness_ms: int | None = Field(description="Thời gian hiện tại của server - timestamp bản tin mới nhất")
+    freshness_level: Literal["FRESH", "DELAYED", "STALE", "NO_DATA"] = Field(
+        description="FRESH < 3000 ms ≤ DELAYED ≤ 10000 ms < STALE")
+    fan_state: int | None
+    mode: str | None
+    gas_ppm: RoundInt | None = Field(None, description="Nồng độ khí mới nhất (ppm)")
+    air_quality: Literal["GOOD", "MID", "BAD"] | None = Field(
+        None, description="< 800 GOOD · 800-1000 MID · > 1000 BAD (mốc đổi được qua /config)")
+    fan_speed_percent: int | None = Field(None, description="0 / 50 / 100")
+    fan_speed_source: Literal["device", "derived"] | None = Field(
+        None, description="device: ESP32 báo về · derived: Backend suy ra từ mức ppm vì firmware chưa gửi")
+    active_alerts: list[str]
+    config_in_sync: bool | None = Field(
+        description="Ngưỡng ESP32 báo về trên .../config/state có khớp bảng device_config không. "
+                    "null = firmware chưa hỗ trợ topic này")
+    device_config: dict[str, float] | None = Field(description="Ngưỡng ESP32 đang thực sự áp dụng")
+    server_time: UtcDateTime
+
+
+class HistoryResponse(BaseModel):
+    device_id: str
+    start: UtcDateTime
+    end: UtcDateTime
+    order: Literal["asc", "desc"]
+    bucket_seconds: int | None
+    limit: int
+    offset: int
+    total: int = Field(description="Tổng số bản ghi (hoặc số khung thời gian nếu có bucket_seconds)")
+    next_offset: int | None = Field(description="Offset của trang tiếp theo, null nếu đã hết")
+    items: list[TelemetryOut]
+
+
+class ActuatorResponse(BaseModel):
+    success: bool = Field(description="Broker đã nhận lệnh (PUBACK QoS 1)")
+    acknowledged: bool = Field(description="ESP32 đã phản hồi actuator/state trong thời gian chờ")
+    confirmed: bool = Field(description="ESP32 phản hồi VÀ trạng thái quạt đúng như yêu cầu")
+    requested_state: int
+    fan_state: int | None
+    reason: str | None
+    rtt_ms: float | None = Field(description="Round-trip time: Backend gửi lệnh -> nhận actuator/state")
+    topic: str
+    payload: dict[str, Any]
+    warning: str | None
+    message: str
+
+
+class ModeResponse(BaseModel):
+    success: bool
+    mode: Mode
+    topic: str
+    payload: dict[str, Any]
+    message: str
+
+
+class DeviceConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    device_id: str
+    temp_threshold: float
+    dwell_time_seconds: int
+    alert_temp_threshold: float
+    ppm_mid_threshold: float = 800
+    ppm_bad_threshold: float = 1000
+    alert_ppm_threshold: float = 1000
+    updated_at: UtcDateTime
+    updated_by: str
+
+
+class ConfigResponse(BaseModel):
+    success: bool
+    config: DeviceConfig
+    published_to_device: bool
+    topic: str | None
+    payload: dict[str, Any] | None
+    message: str
+
+
+class EventOut(BaseModel):
+    id: int
+    time: UtcDateTime
+    device_id: str
+    event_type: str
+    severity: str
+    source: str
+    message: str | None
+    details: dict[str, Any] | None
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok", "degraded"]
+    database: str
+    mqtt: str
+    telegram: str
+    discord: str = Field("not_configured", description="configured · not_configured")
+    ai: str = Field(description="ready · no_model · disabled")
+
+
+class AlertTestResponse(BaseModel):
+    sent: bool
+    detail: str
+
+
+# =====================================================================
+#  DỰ BÁO AI (mô hình của TV5)
+# =====================================================================
+class PredictionOut(BaseModel):
+    """Một lần suy luận đã lưu trong bảng ai_predictions."""
+    timestamp: UtcDateTime = Field(description="Thời điểm suy luận")
+    target_time: UtcDateTime = Field(description="Thời điểm được dự báo = timestamp + 15 phút")
+    prediction_window_minutes: int
+    predicted_pollution_percent: Round1
+    current_pollution_percent: Round1 | None
+    trend: Literal["RISING", "FALLING", "STABLE"]
+    model_version: str | None
+    inference_ms: float | None
+
+
+class ForecastOut(BaseModel):
+    """Một dự báo của mô hình LSTM (bảng ai_forecasts): lớp rủi ro sau horizon_minutes phút."""
+    timestamp: UtcDateTime = Field(description="Lúc dự báo")
+    target_time: UtcDateTime = Field(description="Thời điểm được dự báo (timestamp + horizon_minutes)")
+    horizon_minutes: int
+    hazard_level: int | None = Field(None, description="0 = SAFE, 1 = WARNING, 2 = DANGER")
+    status: str
+    confidence: float | None = Field(None, description="Xác suất của lớp được chọn")
+    prob_safe: float | None = None
+    prob_warning: float | None = None
+    prob_danger: float | None = None
+    current_gas_ppm: RoundInt | None = Field(None, description="Nồng độ khí lúc dự báo (ppm)")
+    temperature: Round1 | None = None
+    humidity: Round1 | None = None
+    model_version: str | None = None
+    inference_ms: float | None = None
+
+
+class PredictionStatus(BaseModel):
+    enabled: bool
+    available: bool = Field(description="Có dự báo mới và AI đang chạy bình thường (không có detail) hay không")
+    model_version: str | None
+    window_size: int | None
+    sample_seconds: int | None
+    detail: str | None = Field(description="Lý do chưa dự báo được, nếu có")
+    latest: ForecastOut | None = Field(description="Dự báo gần nhất đã lưu, kể cả khi đã cũ")
+
+
+class PredictionAccuracy(BaseModel):
+    """MAE/RMSE đo trên DỮ LIỆU THẬT, khác với chỉ số lúc train trên dữ liệu mô phỏng."""
+    device_id: str
+    window_hours: int
+    total_predictions: int = Field(description="Số dự báo đã tới hạn trong khoảng xét")
+    evaluated: int = Field(description="Số dự báo đối chiếu được với giá trị thực đo")
+    mae: float | None = Field(description="Sai số tuyệt đối trung bình (%)")
+    rmse: float | None
+    max_error: float | None
+    bias: float | None = Field(description="Độ lệch hệ thống: dương là dự báo cao hơn thực tế")
+    trend_accuracy_percent: float | None = Field(description="Tỉ lệ đoán đúng chiều tăng/giảm/ổn định")
+    note: str
+
+
+# =====================================================================
+#  CHẨN ĐOÁN - dùng để TV2 tự kiểm tra firmware có đúng data contract không
+# =====================================================================
+class PacketLoss(BaseModel):
+    method: Literal["seq", "time_gap"] = Field(
+        description="seq: đếm chính xác theo số thứ tự · time_gap: ước lượng theo khoảng trống thời gian")
+    received: int
+    expected: int | None
+    missing: int
+    loss_percent: float | None
+    reboots: int = Field(description="Số lần seq bị đặt lại -> thiết bị khởi động lại")
+
+
+class Latency(BaseModel):
+    samples: int
+    avg_ms: float | None
+    max_ms: float | None
+    p95_ms: float | None
+
+
+class ContractCheck(BaseModel):
+    field: str
+    ok: bool
+    detail: str
+
+
+class DiagnosticsResponse(BaseModel):
+    device_id: str
+    window_minutes: int
+    samples: int
+    packet_loss: PacketLoss
+    time_gap_estimate: PacketLoss
+    latency: Latency
+    null_readings: dict[str, int] = Field(description="Số bản ghi thiếu số đo của từng cảm biến")
+    contract: list[ContractCheck] = Field(description="Kết quả đối chiếu với data contract đã thống nhất")
+    passed: bool
